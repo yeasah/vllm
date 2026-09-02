@@ -55,6 +55,12 @@ class KVQuantMode(IntEnum):
     TURBOQUANT_K3V4_NC = 8
     TURBOQUANT_3BIT_NC = 9
     NVFP4_DS_MLA = 10  # opaque-bytes NVFP4 DS-MLA layouts (FlashMLA sparse)
+    # Sinkhorn variance-normalized, K+V packed per group-tile with
+    # tile-shared scales. Names mirror the cache_dtype preset strings.
+    KVARN_K4V2_G128 = 11
+    KVARN_K4V4_G128 = 12
+    KVARN_K4V2_G64 = 13
+    KVARN_K4V4_G64 = 14
 
     @property
     def is_per_token_head(self) -> bool:
@@ -80,6 +86,16 @@ class KVQuantMode(IntEnum):
             KVQuantMode.TURBOQUANT_3BIT_NC,
         )
 
+    @property
+    def is_kvarn(self) -> bool:
+        """True for any KVarN quantization mode."""
+        return self in (
+            KVQuantMode.KVARN_K4V2_G128,
+            KVQuantMode.KVARN_K4V4_G128,
+            KVQuantMode.KVARN_K4V2_G64,
+            KVQuantMode.KVARN_K4V4_G64,
+        )
+
 
 def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
     """Map a ``kv_cache_dtype`` string to a :class:`KVQuantMode`."""
@@ -97,6 +113,8 @@ def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
     if kv_cache_dtype.startswith("nvfp4"):
         return KVQuantMode.NVFP4
     if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("turboquant_"):
+        return KVQuantMode[kv_cache_dtype.upper()]
+    if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("kvarn_"):
         return KVQuantMode[kv_cache_dtype.upper()]
     if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("fp8"):
         return KVQuantMode.FP8_PER_TENSOR

@@ -1179,9 +1179,18 @@ def unify_kv_cache_spec_page_size(
         else:
             layer_page_size = layer_spec.page_size_bytes
             if max_page_size % layer_page_size == 0:
-                ratio = max_page_size // layer_page_size
-                new_block_size = layer_spec.block_size * ratio
-                new_spec = replace(layer_spec, block_size=new_block_size)
+                # KVarN/TurboQuant specs are group-locked: block_size must equal
+                # the variance-normalization tile size, so it cannot be scaled up
+                # to grow the page. Pad the page instead (strided view, as MLA
+                # does), keeping block_size fixed. Upstream carried this as a
+                # `tq_slot_size > 0` test against the old TQ*Spec subclasses;
+                # `state_content_bytes` is the field that replaced them.
+                if getattr(layer_spec, "state_content_bytes", None) is not None:
+                    new_spec = replace(layer_spec, page_size_padded=max_page_size)
+                else:
+                    ratio = max_page_size // layer_page_size
+                    new_block_size = layer_spec.block_size * ratio
+                    new_spec = replace(layer_spec, block_size=new_block_size)
             elif isinstance(layer_spec, AttentionSpec) and not isinstance(
                 layer_spec, MLAAttentionSpec
             ):
