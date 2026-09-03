@@ -235,6 +235,17 @@ class Gemma4Config(VerifyAndUpdateConfig):
 
         max_head_dim = max(head_dims.values())
 
+        # KVarN runs every layer through its own backend (per-layer head_size up
+        # to 512), so the mixed-head-dim backend override below must not claim
+        # them. MLA dtypes route elsewhere and are unaffected.
+        _cache_dtype = getattr(vllm_config.cache_config, "cache_dtype", None)
+        if (
+            isinstance(_cache_dtype, str)
+            and _cache_dtype.startswith("kvarn_")
+            and not _cache_dtype.startswith("kvarn_mla")
+        ):
+            return
+
         if is_fa_version_supported(4) and max_head_dim <= 512:
             if (
                 vllm_config.attention_config.flash_attn_version is None

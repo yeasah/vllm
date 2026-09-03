@@ -838,6 +838,35 @@ class Platform:
                 attn_page_size_1_token = lcm(tq_page, skip_page)
             else:
                 attn_page_size_1_token = tq_page
+        elif cache_config.cache_dtype.startswith("kvarn_") and not (
+            cache_config.cache_dtype.startswith("kvarn_mla")
+        ):
+            # Same situation as TQ above: KVarN packs K|V into a compressed
+            # per-(token, head) slot, so the standard FullAttentionSpec formula
+            # over-sizes the page and the mamba padding is then sized against a
+            # page KVarN never allocates. `customize_spec` reports the real one.
+            # Upstream built a TQFullAttentionSpec with an explicit tq_slot_size
+            # here; that class is gone and the backend hook replaces it.
+            kvarn_spec = FullAttentionSpec(
+                block_size=1,
+                num_kv_heads=model_config.get_num_kv_heads(parallel_config),
+                head_size=model_config.get_head_size(),
+                dtype=kv_cache_dtype,
+                kv_quant_mode=kv_quant_mode,
+            )
+            kvarn_page = backend_cls.customize_spec(kvarn_spec).page_size_bytes
+            if cache_config.kv_cache_dtype_skip_layers:
+                skip_page = FullAttentionSpec(
+                    block_size=1,
+                    num_kv_heads=model_config.get_num_kv_heads(parallel_config),
+                    head_size=model_config.get_head_size(),
+                    dtype=model_config.dtype,
+                ).page_size_bytes
+                # lcm for the same reason as TQ: skip_page is usually not a
+                # multiple of the packed page.
+                attn_page_size_1_token = lcm(kvarn_page, skip_page)
+            else:
+                attn_page_size_1_token = kvarn_page
         else:
             attn_spec = FullAttentionSpec(
                 block_size=1,

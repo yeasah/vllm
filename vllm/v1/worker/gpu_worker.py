@@ -560,6 +560,27 @@ class Worker(WorkerBase):
         ) as profile_result:
             self.model_runner.profile_run()
 
+            # KVarN allocates its shared decode scratch and fp16 tail pools
+            # lazily, and the dummy profile run skips attention entirely
+            # (attn_metadata is None), so without this they first appear during
+            # CUDA-graph capture and land in the graph-memory estimate --
+            # mislabeled, and double-counted against the reservation this
+            # replaces. Materializing them here charges them once, to the right
+            # bucket, and keeps the accounting right even when the cudagraph
+            # estimator is disabled.
+            cache_dtype = self.cache_config.cache_dtype
+            if (
+                isinstance(cache_dtype, str)
+                and cache_dtype.startswith("kvarn_")
+                and not cache_dtype.startswith("kvarn_mla")
+                and not getattr(self.vllm_config.model_config, "use_mla", False)
+            ):
+                from vllm.v1.attention.backends.kvarn_attn import KVarNAttentionImpl
+
+                for impl in KVarNAttentionImpl._all_impls:
+                    impl._ensure_pool(self.device)
+                torch.accelerator.synchronize(self.device)
+
         # Profile CUDA graph memory if graphs will be captured.
         # ROCm is included: #44825 moved the profiler to
         # torch.accelerator.get_memory_info (reliable on ROCm, as used by

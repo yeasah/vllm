@@ -2128,6 +2128,17 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         if N <= 0:
             return output.fill_(0)
 
+        # vLLM allocates the group as [blocks, heads, block_size, slot_bytes]
+        # from `state_content_bytes` and the LBHNC layout; KVarN's kernels index
+        # one contiguous [blocks, heads, tile_bytes] record per (block, head),
+        # because its scales are tile-shared rather than per-slot. The bytes and
+        # their order are identical -- block_size * slot_bytes == tile_bytes --
+        # so folding the trailing pair is a free view, not a copy. Do it before
+        # `_kv_cache_ref` is published, since the metadata builder drives
+        # flushes through that reference.
+        if kv_cache.dim() == 4:
+            kv_cache = kv_cache.view(kv_cache.shape[0], kv_cache.shape[1], -1)
+
         # Make sure pool + block-lookup tensors exist and cover num_blocks.
         self._ensure_pool(kv_cache.device, num_blocks_hint=kv_cache.shape[0])
         # Cache the kv_cache ref so the metadata builder can drive flushes
