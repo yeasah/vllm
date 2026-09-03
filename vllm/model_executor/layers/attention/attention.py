@@ -420,6 +420,13 @@ class Attention(nn.Module, AttentionLayerBase):
             kv_sharing_target_layer_name,
             **extra_impl_args,
         )
+        # Expose the layer name on the impl so backends that scope per-layer /
+        # per-KV-cache-group state (e.g. KVarN's slot allocator) can identify
+        # which group an impl belongs to by matching the builder's layer_names.
+        try:
+            self.impl.layer_name = prefix
+        except Exception:
+            pass
         self.backend = AttentionBackendEnum[self.attn_backend.get_name()]
         self.dtype = dtype
 
