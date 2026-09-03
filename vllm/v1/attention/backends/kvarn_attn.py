@@ -2162,7 +2162,13 @@ class KVarNAttentionImpl(AttentionImpl["KVarNMetadata"]):
         q = query[:N].view(N, self.num_heads, self.head_size)
 
         if not attn_metadata.is_prefill:
-            attn_out = self._decode_path(q, kv_cache, attn_metadata)
+            if os.environ.get("KVARN_FORCE_SLOW_DECODE") == "1":
+                # Debug bisect: route decode through the fp16 dequant + SDPA
+                # fallback instead of the fused Triton kernel. Isolates the
+                # store/quantization round-trip from the decode kernels.
+                attn_out = self._decode_path_slow(q, kv_cache, attn_metadata)
+            else:
+                attn_out = self._decode_path(q, kv_cache, attn_metadata)
         elif (
             attn_metadata.vq_seqlen is not None and attn_metadata.num_decode_tokens == N
         ):
