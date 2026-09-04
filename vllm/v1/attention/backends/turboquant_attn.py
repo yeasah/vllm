@@ -1079,9 +1079,15 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         qdtype = query.dtype
         k_full = torch.empty(seq_len, Hk, D, dtype=qdtype, device=device)
         v_full = torch.empty(seq_len, Hk, D, dtype=qdtype, device=device)
-        k_full[:cached_len] = k_cached_trim.to(qdtype)
+        # copy_ converts dtype inside the copy. `.to(qdtype)` would not: the
+        # rotation above emits fp16 while qdtype follows the query (bf16 on
+        # most models), so the out-of-place conversion materializes a second
+        # full-context tensor before the assignment reads it. Measured on
+        # Qwen3.8-27B at a 117K prompt, that temporary was 229 MiB -- a quarter
+        # of the whole prefill peak -- for a value discarded one line later.
+        k_full[:cached_len].copy_(k_cached_trim)
         k_full[cached_len:] = key_chunk
-        v_full[:cached_len] = v_cached_trim.to(qdtype)
+        v_full[:cached_len].copy_(v_cached_trim)
         v_full[cached_len:] = val_chunk
 
         # Attention: q_len queries attending to seq_len K/V with causal mask
