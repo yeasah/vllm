@@ -896,8 +896,16 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                             loaded_weight=loaded_weight, shard_id=idx
                         )
                 return
-            elif type(param) in (RowvLLMParameter, BasevLLMParameter):
-                param.load_merged_column_weight(loaded_weight=loaded_weight)
+            elif param.handles_fused_shards:
+                # This parameter cannot be narrowed along an output dimension
+                # here, so hand it the whole tensor together with the shard id
+                # it covers -- a tuple such as (0, 1, 2) when one checkpoint
+                # tensor holds several shards, or None when it holds all of
+                # them -- and let it split itself. See
+                # BasevLLMParameter.handles_fused_shards.
+                param.load_merged_column_weight(
+                    loaded_weight=loaded_weight, shard_id=loaded_shard_id
+                )
                 return
             output_sizes = (
                 [self.output_sizes[idx] for idx in loaded_shard_id]
@@ -1135,8 +1143,11 @@ class QKVParallelLinear(ColumnParallelLinear):
                 for idx in range(param.data.shape[0]):
                     param.load_qkv_weight(loaded_weight=loaded_weight, shard_id=idx)
                 return
-            elif type(param) in (RowvLLMParameter, BasevLLMParameter):
-                param.load_qkv_weight(loaded_weight=loaded_weight)
+            elif param.handles_fused_shards:
+                # See MergedColumnParallelLinear.weight_loader_v2.
+                param.load_qkv_weight(
+                    loaded_weight=loaded_weight, shard_id=loaded_shard_id
+                )
                 return
             # TODO: @dsikka - move to parameter.py
             self._load_fused_module_from_checkpoint(param, loaded_weight)
