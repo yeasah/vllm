@@ -19,6 +19,7 @@
 from collections.abc import Iterable
 from typing import TYPE_CHECKING
 
+from vllm.config.utils import getattr_iter
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -59,10 +60,23 @@ class CausalMixin(VllmModelForTextGeneration):
                         self.lm_head = self.lm_head.tie_weights(module)
                         break
 
+            # `logit_scale` is the common spelling; MuseGlimmer calls the same
+            # thing `output_multiplier`, so upstream's plain getattr misses it.
+            logit_scale = getattr_iter(
+                self.text_config, ("logit_scale", "output_multiplier"), 1.0
+            )
+            # Architectures that pre-scale want `T * tanh(z * m / T)`, but
+            # LogitsProcessor applies its scale *after* the cap. Folding the
+            # multiplier into the cap reproduces the intended order exactly:
+            #     tanh(z / (T/m)) * (T/m) * m  ==  T * tanh(z * m / T)
+            # and reduces to upstream's behaviour when m == 1.
+            soft_cap = getattr(self.text_config, "final_logit_softcapping", None)
+            if soft_cap is not None:
+                soft_cap = float(soft_cap) / logit_scale
             self.logits_processor = LogitsProcessor(
                 self.text_config.vocab_size,
-                scale=getattr(self.text_config, "logit_scale", 1.0),
-                soft_cap=getattr(self.text_config, "final_logit_softcapping", None),
+                scale=logit_scale,
+                soft_cap=soft_cap,
             )
         else:
             self.lm_head = PPMissingLayer()
