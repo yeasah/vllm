@@ -313,6 +313,22 @@ class VocabParallelEmbedding(PluggableLayer):
         self.output_partition_sizes = [self.output_size_per_partition]
         self.prefix = prefix
 
+        # Most model files never pass `quant_config` here (78 of 126 that build a
+        # VocabParallelEmbedding omit it), so a quantization method that serves
+        # embeddings is simply unreachable on those architectures. Fall back to the
+        # config being built under, the way linear.py and logits_processor.py already
+        # read ambient state. Configs that do not quantize embeddings return None from
+        # get_quant_method and land on UnquantizedEmbeddingMethod exactly as before.
+        # Skipped when a model preselected `quant_method`, which the dispatch below
+        # gives precedence to in any case.
+        if quant_method is None and quant_config is None:
+            from vllm.config import get_current_vllm_config
+
+            try:
+                quant_config = get_current_vllm_config().quant_config
+            except Exception:
+                quant_config = None
+
         # Avoid overriding a preselected model-specific method with generic
         # config-based dispatch.
         if quant_method is None and quant_config is not None:
