@@ -373,7 +373,11 @@ class ReplicatedLinear(LinearBase):
             self.input_size,
             self.output_size,
             self.params_dtype,
-            weight_loader=self.weight_loader,
+            weight_loader=(
+                self.weight_loader_v2
+                if self.quant_method.__class__.__name__ in WEIGHT_LOADER_V2_SUPPORTED
+                else self.weight_loader
+            ),
         )
 
         if bias:
@@ -399,6 +403,19 @@ class ReplicatedLinear(LinearBase):
             f"to a parameter of size {param.size()}"
         )
         param.data.copy_(loaded_weight)
+
+    def weight_loader_v2(self, param: BasevLLMParameter, loaded_weight: torch.Tensor):
+        # Special case for loading scales off disk, which often do not
+        # have a shape (such as in the case of AutoFP8).
+        if len(loaded_weight.shape) == 0:
+            assert loaded_weight.numel() == 1
+            loaded_weight = loaded_weight.reshape(1)
+
+        # A replicated layer partitions nothing, so the weight is loaded whole.
+        # `BasevLLMParameter.load_row_parallel_weight` is that no-narrowing
+        # load -- the same entry point `PerTensorScaleParameter` relies on for
+        # exactly this reason ("for row parallel layers, no sharding needed").
+        param.load_row_parallel_weight(loaded_weight=loaded_weight)
 
     def forward(
         self,
