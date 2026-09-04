@@ -36,6 +36,21 @@ class BasevLLMParameter(Parameter):
     into the parameter when the provided weight loader is called.
     """
 
+    handles_fused_shards: bool = True
+    """Whether this parameter splits a fused checkpoint tensor itself.
+
+    Some checkpoints store several of a layer's output shards in one tensor.
+    The merged/QKV linear loaders normally narrow such a tensor along
+    ``output_dim`` and load each shard separately, but a parameter without an
+    output dimension -- or one whose sub-tensors have differing output
+    granularity, as in trellis-quantized formats -- cannot be narrowed that
+    way. Those parameters receive the whole tensor plus the shard id it covers
+    and are responsible for splitting it.
+
+    True here because the base parameter has no output dimension to narrow
+    along. Subclasses that do define one set it False.
+    """
+
     def __new__(cls, data: torch.Tensor | None, **kwargs):
         return super().__new__(cls, data=data, requires_grad=False)
 
@@ -136,6 +151,9 @@ class _ColumnvLLMParameter(BasevLLMParameter):
     to be defined. Called within the weight loader of
     each of the column parallel linear layers.
     """
+
+    # Narrowable along output_dim, so the caller splits fused tensors for us.
+    handles_fused_shards: bool = False
 
     def __init__(self, output_dim: int, **kwargs):
         self._output_dim = output_dim
@@ -411,6 +429,12 @@ class SharedWeightParameter(BasevLLMParameter):
     `MergedColumnParallelLinear`, the transform weights must stay separate
     tensors in order to allow for tensor memory sharing between layers.
     """
+
+    # Supports neither route: no output_dim to narrow along, and
+    # load_merged_column_weight requires a concrete shard id, which a fused
+    # tensor does not have. Declared explicitly so the base default does not
+    # silently opt it in.
+    handles_fused_shards: bool = False
 
     # global registry for sharing tensors based on passed `data_key`
     # this dict holds weaksrefs to avoid memory leak after model cleanup
