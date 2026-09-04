@@ -7,6 +7,7 @@ import dataclasses
 import functools
 import json
 import os
+import re
 import sys
 import warnings
 from collections.abc import Callable
@@ -465,6 +466,33 @@ class DeprecatedLogConfigFileAction(argparse.Action):
     def __call__(self, parser, namespace, values, option_string=None):
         warnings.warn(_LOG_CONFIG_FILE_DEPRECATION_MESSAGE, stacklevel=1)
         setattr(namespace, self.dest, values)
+
+
+_BOUNDARY_SPEC = re.compile(r"^boundary:(\d+)$")
+
+
+def _pop_boundary_spec(skip_layers: list[str]) -> tuple[int | None, list[str]]:
+    """Split a ``boundary:N`` entry out of ``--kv-cache-dtype-skip-layers``.
+
+    ``N`` replaces the default first/last-N of
+    ``TurboQuantConfig.get_boundary_skip_layers``; ``boundary:0`` disables
+    boundary protection entirely. Returns the requested N (None if unspecified)
+    and the remaining entries, which are layer indices and attention type names.
+    """
+    n: int | None = None
+    rest: list[str] = []
+    for entry in skip_layers:
+        m = _BOUNDARY_SPEC.match(entry.strip())
+        if m is None:
+            rest.append(entry)
+            continue
+        if n is not None:
+            raise ValueError(
+                "--kv-cache-dtype-skip-layers accepts at most one 'boundary:N' "
+                f"entry, got {skip_layers!r}"
+            )
+        n = int(m.group(1))
+    return n, rest
 
 
 @dataclass
@@ -2290,6 +2318,9 @@ class EngineArgs:
             kv_offloading_backend=self.kv_offloading_backend,
         )
 
+        boundary_n, skip_layers = _pop_boundary_spec(
+            cache_config.kv_cache_dtype_skip_layers
+        )
         # TurboQuant and UltraQuant both keep boundary attention layers at the
         # native dtype, and compute those layers the same way.
         uses_packed_kv_backend = (
@@ -2301,12 +2332,28 @@ class EngineArgs:
                 TurboQuantConfig,
             )
 
-            boundary = TurboQuantConfig.get_boundary_skip_layers(model_config)
+            boundary = TurboQuantConfig.get_boundary_skip_layers(
+                model_config, **({} if boundary_n is None else {"n": boundary_n})
+            )
+            if boundary_n is not None:
+                logger.info(
+                    "Boundary protection: first/last %d layers (default 2), "
+                    "skip layers %s",
+                    boundary_n,
+                    boundary,
+                )
             # Sorted so the order does not depend on set iteration: the list is
             # a CacheConfig hash factor. Entries can also be attention type
             # names (e.g. "sliding_window"), so sort them as strings.
             cache_config.kv_cache_dtype_skip_layers = sorted(
-                set(cache_config.kv_cache_dtype_skip_layers) | set(boundary)
+                set(skip_layers) | set(boundary)
+            )
+        elif boundary_n is not None:
+            raise ValueError(
+                "'boundary:N' in --kv-cache-dtype-skip-layers selects the "
+                "first/last-N boundary protection of a packed KV cache and only "
+                "applies to a turboquant_* or ultraquant_4bit cache dtype, not "
+                f"{resolved_cache_dtype!r}."
             )
 
         ray_runtime_env = None
