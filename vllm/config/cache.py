@@ -113,7 +113,24 @@ class CacheConfig:
       reproducible hashing. Requires the optional ``xxhash`` package."""
     kv_cache_dtype_skip_layers: list[str] = field(default_factory=list)
     """Layer patterns to skip KV cache quantization. Accepts layer indices
-    (e.g., '0', '2', '4') or attention type names (e.g., 'sliding_window')."""
+    (e.g., '0', '2', '4'), attention type names (e.g., 'sliding_window'), and
+    for a ``turboquant_*`` cache dtype ``'boundary:N'``, which sets how many
+    layers at each end keep a native cache (default 2, ``'boundary:0'`` for
+    none). The boundary entry is resolved into layer indices while the engine
+    config is built and does not appear in the stored list.
+
+    ``boundary:N`` is symmetric; asymmetric protection is spelled by disabling it
+    and listing the layers, which stays model-portable because layer indices are
+    numbered from the front. To keep a native cache on only the first layer, the
+    configuration that measures best on the models tested so far::
+
+        --kv-cache-dtype-skip-layers 0 boundary:0
+
+    and for a sliding-window model, whose sliding layers must stay native
+    because TurboQuant cannot serve a sliding window::
+
+        --kv-cache-dtype-skip-layers 0 sliding_window boundary:0
+    """
     mamba_page_size_padded: int | None = None
     """ Optional override for mamba page size; used by hybrid mamba/attention
     models to ensure exact alignment with attention page size."""

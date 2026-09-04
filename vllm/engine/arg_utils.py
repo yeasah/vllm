@@ -7,6 +7,7 @@ import dataclasses
 import functools
 import json
 import os
+import re
 import sys
 from collections.abc import Callable
 from dataclasses import MISSING, asdict, dataclass, fields, is_dataclass
@@ -418,6 +419,43 @@ def get_kwargs(cls: ConfigType) -> dict[str, dict[str, Any]]:
     cached version.
     """
     return copy.deepcopy(_compute_kwargs(cls))
+
+
+_BOUNDARY_SPEC = re.compile(r"^boundary:(\d+)$")
+
+
+def _pop_boundary_spec(skip_layers: list[str]) -> tuple[int | None, list[str]]:
+    """Split a ``boundary:N`` entry out of ``--kv-cache-dtype-skip-layers``.
+
+    ``N`` replaces the default first/last-N of
+    ``TurboQuantConfig.get_boundary_skip_layers``; ``boundary:0`` disables
+    boundary protection entirely. Returns the requested N (None if unspecified)
+    and the remaining entries, which are layer indices and attention type names.
+    """
+    n: int | None = None
+    rest: list[str] = []
+    for entry in skip_layers:
+        m = _BOUNDARY_SPEC.match(entry.strip())
+        if m is None:
+            rest.append(entry)
+            continue
+        if n is not None:
+            raise ValueError(
+                "--kv-cache-dtype-skip-layers accepts at most one 'boundary:N' "
+                f"entry, got {skip_layers!r}"
+            )
+        n = int(m.group(1))
+    return n, rest
+
+
+def _skip_layer_sort_key(entry: str) -> tuple[int, int, str]:
+    """Order skip-layer entries with mixed indices and keyword names.
+
+    Layer indices sort numerically ahead of attention type names such as
+    ``sliding_window``; a plain ``key=int`` raises on the keywords, which are a
+    documented part of this flag's vocabulary.
+    """
+    return (0, int(entry), "") if entry.isdigit() else (1, 0, entry)
 
 
 @dataclass
@@ -2014,15 +2052,32 @@ class EngineArgs:
             kv_offloading_backend=self.kv_offloading_backend,
         )
 
+        boundary_n, skip_layers = _pop_boundary_spec(
+            cache_config.kv_cache_dtype_skip_layers
+        )
         if resolved_cache_dtype.startswith("turboquant_"):
             from vllm.model_executor.layers.quantization.turboquant.config import (
                 TurboQuantConfig,
             )
 
-            boundary = TurboQuantConfig.get_boundary_skip_layers(model_config)
-            existing = set(cache_config.kv_cache_dtype_skip_layers)
+            boundary = TurboQuantConfig.get_boundary_skip_layers(
+                model_config, **({} if boundary_n is None else {"n": boundary_n})
+            )
+            if boundary_n is not None:
+                logger.info(
+                    "TurboQuant boundary protection: first/last %d layers "
+                    "(default 2), skip layers %s",
+                    boundary_n,
+                    boundary,
+                )
             cache_config.kv_cache_dtype_skip_layers = sorted(
-                existing | set(boundary), key=int
+                set(skip_layers) | set(boundary), key=_skip_layer_sort_key
+            )
+        elif boundary_n is not None:
+            raise ValueError(
+                "'boundary:N' in --kv-cache-dtype-skip-layers selects TurboQuant's "
+                "first/last-N boundary protection and only applies to a "
+                f"turboquant_* cache dtype, not {resolved_cache_dtype!r}."
             )
 
         ray_runtime_env = None
