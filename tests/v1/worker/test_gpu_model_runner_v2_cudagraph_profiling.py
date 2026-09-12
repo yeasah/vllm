@@ -105,7 +105,9 @@ def _patch_module(monkeypatch) -> None:
         cgu, "_init_minimal_kv_cache_for_profiling", lambda r: r.events.append("init")
     )
     monkeypatch.setattr(
-        cgu, "_teardown_profiling_state", lambda r: r.events.append("teardown")
+        cgu,
+        "_teardown_profiling_state",
+        lambda r, sizes: r.events.append("teardown"),
     )
     # The profiler reads free GPU memory before/after to compute what it
     # retained; default to a constant (nothing retained).
@@ -433,7 +435,7 @@ def test_teardown_profiling_state_clears_mamba_align_metadata(monkeypatch):
     monkeypatch.setattr(cgu.torch.accelerator, "synchronize", lambda: None)
     monkeypatch.setattr(cgu.torch.accelerator, "empty_cache", lambda: None)
 
-    cgu._teardown_profiling_state(runner)
+    cgu._teardown_profiling_state(runner, [])
 
     assert runner.model_state._mamba_ctx is None
     assert runner.model_state._mamba_group_ids == []

@@ -113,6 +113,39 @@ class WorkspaceManager:
         """Check if workspace is locked."""
         return self._locked
 
+    def sizes(self) -> list[int]:
+        """Current size in bytes of each ``(ubatch, lane)`` slot."""
+        return [self._workspace_size_bytes(ws) for ws in self._current_workspaces]
+
+    def shrink_to(self, sizes: list[int]) -> None:
+        """Give back growth past ``sizes``, leaving each slot at that size.
+
+        Slots at or below their entry in ``sizes`` are left alone. A slot above
+        it is reallocated at the smaller size, which is safe for the same reason
+        growing is: callers hold views that keep the old buffer alive for as
+        long as they use it, and take the new one on their next request. A slot
+        ``sizes`` does not cover did not exist when it was taken, so all of it
+        is growth and all of it is given back.
+        """
+        for i in range(len(self._current_workspaces)):
+            target = sizes[i] if i < len(sizes) else 0
+            current = self._workspace_size_bytes(self._current_workspaces[i])
+            if current <= target:
+                continue
+            self._current_workspaces[i] = None
+            torch.accelerator.empty_cache()
+            if target > 0:
+                self._current_workspaces[i] = torch.empty(
+                    (target,), dtype=torch.uint8, device=self._device
+                )
+            if envs.VLLM_DEBUG_WORKSPACE:
+                logger.info(
+                    "[WORKSPACE DEBUG] Shrank workspace %d: %.2f MB -> %.2f MB",
+                    i,
+                    current / _MB,
+                    target / _MB,
+                )
+
     def get_simultaneous(
         self, *shapes_and_dtypes: tuple[tuple[int, ...], torch.dtype]
     ) -> list[torch.Tensor]:
@@ -302,6 +335,27 @@ def unlock_workspace() -> None:
     called again to prevent unexpected allocations.
     """
     current_workspace_manager().unlock()
+
+
+def workspace_sizes() -> list[int]:
+    """Current workspace size per slot, or ``[]`` if there is no manager yet.
+
+    Pair with :func:`shrink_workspace_to` to bracket a phase whose workspace
+    allocations are thrown away. Growth is otherwise one-way: whoever asks for
+    the largest buffer fixes the size for the rest of the process. That is the
+    intent during warmup, whose job is to reach the runtime maximum before
+    ``lock_workspace``, and wrong for metadata builders constructed only to
+    profile CUDA graph capture -- those size themselves from a ``max_model_len``
+    that auto-fit has not revised down yet, and their reservation would become
+    the floor for the real builders that replace them.
+    """
+    return [] if _manager is None else _manager.sizes()
+
+
+def shrink_workspace_to(sizes: list[int]) -> None:
+    """Give back workspace growth past ``sizes`` (see :func:`workspace_sizes`)."""
+    if _manager is not None:
+        _manager.shrink_to(sizes)
 
 
 def reset_workspace_manager() -> None:

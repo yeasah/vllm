@@ -237,7 +237,11 @@ from vllm.v1.worker.utils import (
     is_residual_scattered_for_sp,
     raise_if_nan_logits,
 )
-from vllm.v1.worker.workspace import lock_workspace
+from vllm.v1.worker.workspace import (
+    lock_workspace,
+    shrink_workspace_to,
+    workspace_sizes,
+)
 
 from .utils import (
     AttentionGroup,
@@ -6662,7 +6666,9 @@ class GPUModelRunner(
             torch.accelerator.empty_cache()
             torch.accelerator.synchronize()
 
-    def _cleanup_profiling_kv_cache(self) -> None:
+    def _cleanup_profiling_kv_cache(
+        self, entry_workspace_sizes: list[int] | None = None
+    ) -> None:
         torch.accelerator.synchronize()
         if hasattr(self, "kv_caches") and self.kv_caches:
             for i in range(len(self.kv_caches)):
@@ -6687,6 +6693,11 @@ class GPUModelRunner(
                     layer.impl._k_scale_cache = None
                 if hasattr(layer.impl, "_v_scale_cache"):
                     layer.impl._v_scale_cache = None
+
+        # The builders died with `attn_groups`; their workspace reservation,
+        # sized from a pre-auto-fit `max_model_len`, would outlive them.
+        if entry_workspace_sizes is not None:
+            shrink_workspace_to(entry_workspace_sizes)
 
         gc.collect()
         torch.accelerator.empty_cache()
@@ -6731,6 +6742,9 @@ class GPUModelRunner(
 
     @torch.inference_mode()
     def profile_cudagraph_memory(self) -> int:
+        # Everything the profiling phase allocates from the workspace is
+        # discarded with it; see `workspace_sizes`.
+        entry_workspace_sizes = workspace_sizes()
         with set_current_vllm_config(self.vllm_config):
             self._init_minimal_kv_cache_for_profiling()
 
@@ -6750,7 +6764,7 @@ class GPUModelRunner(
         total_graphs = decoder_graphs + encoder_graphs
         if total_graphs == 0:
             logger.debug("No CUDA graphs will be captured, skipping profiling")
-            self._cleanup_profiling_kv_cache()
+            self._cleanup_profiling_kv_cache(entry_workspace_sizes)
             return 0
 
         graph_groups = [
@@ -6879,7 +6893,7 @@ class GPUModelRunner(
                 key_set.clear()
             self.cudagraph_dispatcher.keys_initialized = False
             self.maybe_remove_all_loras(self.lora_config)
-            self._cleanup_profiling_kv_cache()
+            self._cleanup_profiling_kv_cache(entry_workspace_sizes)
             compilation_counter.num_cudagraph_captured = saved_num_cudagraph_captured
 
         # FULL and PIECEWISE graphs share the global pool at runtime and are

@@ -100,3 +100,50 @@ def test_workspace_lane_validation(monkeypatch) -> None:
 
     with pytest.raises(ValueError, match="at least one"):
         workspace.WorkspaceManager(torch.device("cpu"), num_lanes=0)
+
+
+def test_shrink_to_gives_back_only_growth_past_the_mark(monkeypatch) -> None:
+    """The mark exists so a discarded phase does not set the floor.
+
+    ``_ensure_workspace_size`` only grows, so a metadata builder constructed to
+    profile CUDA graph capture -- sized from a ``max_model_len`` that auto-fit
+    has not revised down yet -- would otherwise leave its reservation behind for
+    the real builders to inherit.
+    """
+    monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
+    manager = workspace.WorkspaceManager(torch.device("cpu"), num_lanes=2)
+
+    # Growth from warmup, which must survive: it is what `lock_workspace`
+    # relies on having reached the runtime maximum.
+    manager.get_simultaneous(((512,), torch.uint8))
+    mark = manager.sizes()
+
+    with workspace.use_workspace_lane(1):
+        manager.get_simultaneous(((4096,), torch.uint8))
+    manager.get_simultaneous(((8192,), torch.uint8))
+
+    manager.shrink_to(mark)
+
+    assert manager._current_workspaces[0].numel() == 512  # type: ignore[union-attr]
+    # Lane 1 did not exist at the mark, so all of it is growth.
+    assert manager._current_workspaces[1] is None
+    # And the floor really did move back: the next request resizes rather than
+    # free-riding on the discarded phase's buffer.
+    (reused,) = manager.get_simultaneous(((1024,), torch.uint8))
+    assert manager._current_workspaces[0].numel() == 1024  # type: ignore[union-attr]
+    assert reused.numel() == 1024
+
+
+def test_shrink_to_leaves_outstanding_views_valid(monkeypatch) -> None:
+    monkeypatch.setattr(workspace, "dbo_current_ubatch_id", lambda: 0)
+    manager = workspace.WorkspaceManager(torch.device("cpu"), num_lanes=1)
+
+    mark = manager.sizes()
+    (held,) = manager.get_simultaneous(((256,), torch.uint8))
+    held.fill_(7)
+
+    manager.shrink_to(mark)
+
+    assert manager._current_workspaces[0] is None
+    assert held.numel() == 256
+    assert int(held[0]) == 7
