@@ -353,6 +353,9 @@ def _tq_full_dequant_kv(
     BLOCK_D: tl.constexpr,
     NORM_CORRECTION: tl.constexpr = 0,
     FP8_E4B15: tl.constexpr = 0,  # 1 = use e4b15 (Ampere/Ada), 0 = e4nv (Hopper+)
+    # First context position this launch covers. The grid is sized to the
+    # slab, not to the context, so the output is always written from 0.
+    POS_OFFSET: tl.constexpr = 0,
 ):
     """Full dequant: reconstruct K (MSE centroids * norm or FP8) and V to fp16.
 
@@ -363,8 +366,12 @@ def _tq_full_dequant_kv(
     bid = bh // NUM_KV_HEADS
     hid = bh % NUM_KV_HEADS
 
-    page_idx = pos // BLOCK_SIZE
-    page_off = pos % BLOCK_SIZE
+    # POS_OFFSET shifts where in the *cache* this program reads while leaving
+    # the output index alone, so a caller can dequantize [off, off + slab) of
+    # the context into a slab-sized buffer instead of the whole thing.
+    pos_abs = pos + POS_OFFSET
+    page_idx = pos_abs // BLOCK_SIZE
+    page_off = pos_abs % BLOCK_SIZE
     block_num = tl.load(Block_table_ptr + bid * stride_bt_b + page_idx).to(tl.int64)
 
     block_base = block_num * stride_cache_block
