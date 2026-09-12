@@ -49,6 +49,7 @@ from vllm.v1.attention.backends.fa_utils import (
     is_flash_attn_varlen_func_available,
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
+from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 
 # FlyDSL TurboQuant decode (AMD gfx950). Auto-selected when FlyDSL is available
 # for eligible layers (SoA store + FlyDSL decode + SoA-aware continuation);
@@ -256,6 +257,36 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
         max_cached_len = max(0, model_config.max_model_len - 1)
         alloc_len = round_up(max_cached_len, self.kv_cache_spec.block_size)
         cache_buf_shape = (1, num_kv_heads, alloc_len, head_size)
+        # The chunked path sizes its buffers by the slab, so its reservation is
+        # a byte budget and not a shape: it carves its own views out of this,
+        # from its own head_size, which the spec's padded one only ever
+        # over-states. Reserving by bytes is what keeps the two sides from
+        # having to agree on a token count derived from different dimensions.
+        budget = (
+            max(0, self.vllm_config.attention_config.tq_prefill_workspace_mib)
+            * 1024
+            * 1024
+        )
+        if budget and _HAS_FLASH_ATTN:
+            # Cap by what a slab covering the whole declared context would
+            # cost, so a short context reserves less than the budget allows.
+            # The cap has to be priced in the *chunked* layout, not the
+            # monolithic one: that layout carries two more buffers per token
+            # (the rotated keys, and the copy laid out for flash-attention),
+            # so pricing the cap the monolithic way would under-reserve for
+            # any model whose declared context lands between the two, and
+            # the first long prefill would hit the workspace lock. The spec's
+            # head_size only ever overstates the impl's, and the rotated
+            # buffer is counted even for fp8 keys, which do not have one.
+            chunked_bytes = alloc_len * num_kv_heads * head_size * (
+                2 * 2 + 2 + 2 * model_config.dtype.itemsize
+            )
+            # Slack covers get_simultaneous' 256-byte alignment per buffer.
+            current_workspace_manager().get_simultaneous(
+                (((min(budget, chunked_bytes) + 2048,)), torch.uint8),
+            )
+            return
+
         current_workspace_manager().get_simultaneous(
             (cache_buf_shape, torch.float16),
             (cache_buf_shape, torch.float16),
@@ -364,6 +395,11 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         # Cache max_model_len now (config is available at __init__ but NOT
         # during CUDA-graph capture when _ensure_on_device is re-entered).
         self._max_model_len = vllm_config.model_config.max_model_len
+        # Continuation-prefill dequant budget. Read here for the same reason
+        # as max_model_len: the config is not available during graph capture.
+        self._prefill_workspace_bytes = (
+            max(0, vllm_config.attention_config.tq_prefill_workspace_mib) * 1024 * 1024
+        )
         # SoA store is required by the FlyDSL decode/continuation path, so it
         # tracks FlyDSL availability (single switch for the whole pipeline).
         self._use_flydsl = is_flydsl_available()
@@ -378,21 +414,14 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         cu_seqlens_k: torch.Tensor,
         max_seqlen_q: int,
         max_seqlen_k: int,
-    ) -> torch.Tensor:
+        causal: bool = True,
+        return_softmax_lse: bool = False,
+    ):
+        kwargs: dict[str, Any] = {}
         # fa_utils.get_flash_attn_version() returns None on backends that
         # should not pass an explicit fa_version kwarg.
-        if self.fa_version is None:
-            return flash_attn_varlen_func(
-                q=q,
-                k=k,
-                v=v,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                max_seqlen_q=max_seqlen_q,
-                max_seqlen_k=max_seqlen_k,
-                softmax_scale=self.scale,
-                causal=True,
-            )
+        if self.fa_version is not None:
+            kwargs["fa_version"] = self.fa_version
         return flash_attn_varlen_func(
             q=q,
             k=k,
@@ -402,8 +431,9 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
             softmax_scale=self.scale,
-            causal=True,
-            fa_version=self.fa_version,
+            causal=causal,
+            return_softmax_lse=return_softmax_lse,
+            **kwargs,
         )
 
     def _ensure_on_device(self, layer, device):
@@ -904,7 +934,161 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
 
         return output
 
+    def _dequant_context(
+        self,
+        kv_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        centroids: torch.Tensor,
+        k_out: torch.Tensor,  # (1, Hk, >= n_pos, D) float16
+        v_out: torch.Tensor,
+        n_pos: int,
+        pos_offset: int = 0,
+    ) -> None:
+        """Dequantize `[pos_offset, pos_offset + n_pos)` of the cached context.
+
+        Written from row 0 of the destination whatever `pos_offset` is, so the
+        buffers are sized by the slab rather than by the context.
+        """
+        D = k_out.shape[3]
+        Hk = k_out.shape[1]
+        device = k_out.device
+        block_size = kv_cache.shape[1]
+        BLOCK_D = triton.next_power_of_2(D)
+        mse_bytes = self._mse_bytes
+        val_data_bytes = self._val_data_bytes
+
+        grid = (n_pos, Hk)
+        if self._soa_store:
+            # SoA-aware dequant: read the data/metadata-separated SoA cache
+            # written by the SoA store. Constants must match the store side.
+            _, soa_dequant, _ = _soa_imports()
+            key_fp8 = self.tq_config.key_fp8
+            key_data_bytes = D if key_fp8 else mse_bytes
+            data_bytes_per_slot = key_data_bytes + val_data_bytes
+            meta_region_offset = block_size * Hk * data_bytes_per_slot
+            num_soa_fields = 2 if key_fp8 else 3
+            soa_k_norm = 0
+            soa_v_scale = 0 if key_fp8 else 1
+            soa_v_zero = 1 if key_fp8 else 2
+            kv_cache_u16 = kv_cache.view(torch.uint16)
+            soa_dequant[grid](
+                kv_cache,
+                kv_cache_u16,
+                block_table,
+                centroids,
+                k_out,
+                v_out,
+                k_out.stride(0),
+                k_out.stride(1),
+                k_out.stride(2),
+                v_out.stride(0),
+                v_out.stride(1),
+                v_out.stride(2),
+                kv_cache.stride(0),
+                block_table.stride(0),
+                HEAD_DIM=D,
+                BLOCK_SIZE=block_size,
+                NUM_KV_HEADS=Hk,
+                MSE_BYTES=mse_bytes,
+                VQB=self.tq_config.effective_value_quant_bits,
+                VAL_DATA_BYTES=val_data_bytes,
+                MSE_BITS=self.tq_config.key_mse_bits,
+                KEY_FP8=1 if key_fp8 else 0,
+                KEY_DATA_BYTES=key_data_bytes,
+                META_REGION_OFFSET=meta_region_offset,
+                NUM_SOA_FIELDS=num_soa_fields,
+                SOA_K_NORM=soa_k_norm,
+                SOA_V_SCALE=soa_v_scale,
+                SOA_V_ZERO=soa_v_zero,
+                BLOCK_D=BLOCK_D,
+                NORM_CORRECTION=1 if self.tq_config.norm_correction else 0,
+                FP8_E4B15=_use_fp8_e4b15(device.index or 0),
+                POS_OFFSET=pos_offset,
+                num_warps=4,
+            )
+        else:
+            _tq_full_dequant_kv[grid](
+                kv_cache,
+                block_table,
+                centroids,
+                k_out,
+                v_out,
+                k_out.stride(0),
+                k_out.stride(1),
+                k_out.stride(2),
+                v_out.stride(0),
+                v_out.stride(1),
+                v_out.stride(2),
+                kv_cache.stride(0),
+                kv_cache.stride(1),
+                kv_cache.stride(2),
+                block_table.stride(0),
+                HEAD_DIM=D,
+                BLOCK_SIZE=block_size,
+                NUM_KV_HEADS=Hk,
+                MSE_BYTES=mse_bytes,
+                KPS=self.tq_config.key_packed_size,
+                VQB=self.tq_config.effective_value_quant_bits,
+                VAL_DATA_BYTES=val_data_bytes,
+                MSE_BITS=self.tq_config.key_mse_bits,
+                KEY_FP8=1 if self.tq_config.key_fp8 else 0,
+                BLOCK_D=BLOCK_D,
+                NORM_CORRECTION=1 if self.tq_config.norm_correction else 0,
+                FP8_E4B15=_use_fp8_e4b15(device.index or 0),
+                POS_OFFSET=pos_offset,
+                num_warps=4,
+            )
+
+    def _prefill_slab_tokens(self, Hk: int, D: int, block_size: int, qdtype) -> int:
+        """Context positions per dequant slab, or 0 to do it in one piece.
+
+        Derived from the configured byte budget rather than set directly: the
+        slab buffers are `num_kv_heads` x `head_size` wide and there are four
+        or five of them, so a token figure would make the operator do that
+        arithmetic. Rounded down to a
+        whole number of KV blocks, and at least one block -- a budget too small
+        for a single block is honoured as "no chunking" rather than silently
+        producing a degenerate slab.
+
+        The monolithic path is the only one available without flash-attention,
+        whose log-sum-exp output the merge needs.
+        """
+        if not self._prefill_workspace_bytes or not _HAS_FLASH_ATTN:
+            return 0
+        per_token = Hk * D * (
+            2 * 2  # k/v dequant targets, always fp16
+            + (2 if not self.tq_config.key_fp8 else 0)  # rotated keys
+            + 2 * qdtype.itemsize  # k/v laid out for flash-attention
+        )
+        slab = (self._prefill_workspace_bytes // per_token // block_size) * block_size
+        return slab if slab >= block_size else 0
+
     def _continuation_prefill(
+        self,
+        layer: Any,
+        query: torch.Tensor,
+        key_chunk: torch.Tensor,
+        val_chunk: torch.Tensor,
+        kv_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        cached_len: int,
+        seq_len: int,
+        Pi: torch.Tensor,
+        centroids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Attend a continuation chunk to everything already cached."""
+        slab = self._prefill_slab_tokens(
+            key_chunk.shape[1], query.shape[2], kv_cache.shape[1], query.dtype
+        )
+        args = (
+            layer, query, key_chunk, val_chunk, kv_cache, block_table,
+            cached_len, seq_len, Pi, centroids,
+        )
+        if slab and cached_len > slab:
+            return self._continuation_prefill_chunked(*args, slab=slab)
+        return self._continuation_prefill_monolithic(*args)
+
+    def _continuation_prefill_monolithic(
         self,
         layer: Any,
         query: torch.Tensor,  # (q_len, Hq, D)
@@ -948,86 +1132,9 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         k_cached = k_buf[:, :, :alloc_len, :]
         v_cached = v_buf[:, :, :alloc_len, :]
 
-        grid = (alloc_len, 1 * Hk)
-        if self._soa_store:
-            # SoA-aware dequant: read the data/metadata-separated SoA cache
-            # written by the SoA store. Constants must match the store side.
-            _, soa_dequant, _ = _soa_imports()
-            key_fp8 = self.tq_config.key_fp8
-            key_data_bytes = D if key_fp8 else mse_bytes
-            data_bytes_per_slot = key_data_bytes + val_data_bytes
-            meta_region_offset = block_size * Hk * data_bytes_per_slot
-            num_soa_fields = 2 if key_fp8 else 3
-            soa_k_norm = 0
-            soa_v_scale = 0 if key_fp8 else 1
-            soa_v_zero = 1 if key_fp8 else 2
-            kv_cache_u16 = kv_cache.view(torch.uint16)
-            soa_dequant[grid](
-                kv_cache,
-                kv_cache_u16,
-                block_table,
-                centroids,
-                k_cached,
-                v_cached,
-                k_cached.stride(0),
-                k_cached.stride(1),
-                k_cached.stride(2),
-                v_cached.stride(0),
-                v_cached.stride(1),
-                v_cached.stride(2),
-                kv_cache.stride(0),
-                block_table.stride(0),
-                HEAD_DIM=D,
-                BLOCK_SIZE=block_size,
-                NUM_KV_HEADS=Hk,
-                MSE_BYTES=mse_bytes,
-                VQB=self.tq_config.effective_value_quant_bits,
-                VAL_DATA_BYTES=val_data_bytes,
-                MSE_BITS=self.tq_config.key_mse_bits,
-                KEY_FP8=1 if key_fp8 else 0,
-                KEY_DATA_BYTES=key_data_bytes,
-                META_REGION_OFFSET=meta_region_offset,
-                NUM_SOA_FIELDS=num_soa_fields,
-                SOA_K_NORM=soa_k_norm,
-                SOA_V_SCALE=soa_v_scale,
-                SOA_V_ZERO=soa_v_zero,
-                BLOCK_D=BLOCK_D,
-                NORM_CORRECTION=1 if self.tq_config.norm_correction else 0,
-                FP8_E4B15=_use_fp8_e4b15(device.index or 0),
-                num_warps=4,
-            )
-        else:
-            _tq_full_dequant_kv[grid](
-                kv_cache,
-                block_table,
-                centroids,
-                k_cached,
-                v_cached,
-                k_cached.stride(0),
-                k_cached.stride(1),
-                k_cached.stride(2),
-                v_cached.stride(0),
-                v_cached.stride(1),
-                v_cached.stride(2),
-                kv_cache.stride(0),
-                kv_cache.stride(1),
-                kv_cache.stride(2),
-                block_table.stride(0),
-                HEAD_DIM=D,
-                BLOCK_SIZE=block_size,
-                NUM_KV_HEADS=Hk,
-                MSE_BYTES=mse_bytes,
-                KPS=self.tq_config.key_packed_size,
-                VQB=self.tq_config.effective_value_quant_bits,
-                VAL_DATA_BYTES=val_data_bytes,
-                MSE_BITS=self.tq_config.key_mse_bits,
-                KEY_FP8=1 if self.tq_config.key_fp8 else 0,
-                BLOCK_D=BLOCK_D,
-                NORM_CORRECTION=1 if self.tq_config.norm_correction else 0,
-                FP8_E4B15=_use_fp8_e4b15(device.index or 0),
-                num_warps=4,
-            )
-
+        self._dequant_context(
+            kv_cache, block_table, centroids, k_cached, v_cached, alloc_len
+        )
         # Inverse-rotate MSE keys back to original space
         if not self.tq_config.key_fp8:
             # fp16 matmul for rotation (2× less bandwidth, uses fp16 tensor cores)
@@ -1100,6 +1207,118 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 enable_gqa=(Hk < Hq),
             )  # (1, Hq, q_len, D)
             return out[0].transpose(0, 1)  # (q_len, Hq, D)
+
+    def _continuation_prefill_chunked(
+        self,
+        layer: Any,
+        query: torch.Tensor,  # (q_len, Hq, D)
+        key_chunk: torch.Tensor,  # (q_len, Hk, D)
+        val_chunk: torch.Tensor,  # (q_len, Hk, D)
+        kv_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        cached_len: int,
+        seq_len: int,
+        Pi: torch.Tensor,
+        centroids: torch.Tensor,
+        slab: int = 0,
+    ) -> torch.Tensor:
+        """Same attention as the monolithic path, in slabs of the cached context.
+
+        Every query attends to *all* of the cached prefix -- the causal mask
+        only starts biting inside the current chunk -- so the prefix can be cut
+        anywhere and its partial attentions merged by log-sum-exp, and the
+        chunk is plain causal self-attention against its own K/V. Nothing here
+        is ever sized by `cached_len`: the buffers are the slab, the partials
+        are the chunk.
+
+        See tests/kernels/turboquant/test_continuation_prefill_split.py, which
+        pins that decomposition against fp32 SDPA under the explicit mask.
+        """
+        q_len, Hq, D = query.shape
+        Hk = key_chunk.shape[1]
+        device = query.device
+        qdtype = query.dtype
+        rotate = not self.tq_config.key_fp8
+
+        cu_q = torch.tensor([0, q_len], device=device, dtype=torch.int32)
+
+        # One request covering the largest slab; later slabs reuse the views.
+        shapes = [
+            (((1, Hk, slab, D)), torch.float16),  # K dequant target
+            (((1, Hk, slab, D)), torch.float16),  # V dequant target
+            (((slab, Hk, D)), qdtype),  # K for flash-attention
+            (((slab, Hk, D)), qdtype),  # V for flash-attention
+        ]
+        if rotate:
+            # The rotation is a matmul, so it cannot write over its own input.
+            shapes.append((((Hk * slab, D)), torch.float16))
+        bufs = current_workspace_manager().get_simultaneous(*shapes)
+        k_dq, v_dq, k_fa, v_fa = bufs[:4]
+        k_rot = bufs[4] if rotate else None
+
+        acc_o: torch.Tensor | None = None
+        acc_lse: torch.Tensor | None = None
+
+        for start in range(0, cached_len, slab):
+            n = min(slab, cached_len - start)
+            self._dequant_context(
+                kv_cache, block_table, centroids, k_dq, v_dq, n, start
+            )
+
+            if rotate:
+                # Rotate the whole slab even when the last one is short: the
+                # matmul is row-independent, and slicing k_dq first would make
+                # the reshape non-contiguous and copy.
+                Pi_half = layer._tq_Pi_half
+                torch.mm(k_dq[0].reshape(-1, D), Pi_half, out=k_rot)
+                k_src = k_rot.reshape(Hk, slab, D)[:, :n, :]
+            else:
+                k_src = k_dq[0, :, :n, :]
+            # copy_ converts dtype inside the copy; `.to()` here would
+            # materialize a second slab. See the note in the monolithic path.
+            k_fa[:n].copy_(k_src.transpose(0, 1))
+            v_fa[:n].copy_(v_dq[0, :, :n, :].transpose(0, 1))
+
+            o_i, lse_i = self._flash_attn_varlen(
+                q=query,
+                k=k_fa[:n],
+                v=v_fa[:n],
+                cu_seqlens_q=cu_q,
+                cu_seqlens_k=torch.tensor([0, n], device=device, dtype=torch.int32),
+                max_seqlen_q=q_len,
+                max_seqlen_k=n,
+                causal=False,
+                return_softmax_lse=True,
+            )
+            if acc_o is None:
+                acc_o, acc_lse = o_i.float(), lse_i
+            else:
+                # fp32 throughout: each merge rounds to the accumulator's
+                # dtype, so a bf16 one would compound once per slab.
+                merged_o = torch.empty_like(acc_o)
+                merged_lse = torch.empty_like(acc_lse)
+                merge_attn_states(
+                    merged_o, acc_o, acc_lse, o_i.float(), lse_i,
+                    output_lse=merged_lse,
+                )
+                acc_o, acc_lse = merged_o, merged_lse
+
+        suffix_o, suffix_lse = self._flash_attn_varlen(
+            q=query,
+            k=key_chunk,
+            v=val_chunk,
+            cu_seqlens_q=cu_q,
+            cu_seqlens_k=cu_q,
+            max_seqlen_q=q_len,
+            max_seqlen_k=q_len,
+            causal=True,
+            return_softmax_lse=True,
+        )
+        # merge_attn_states requires one dtype across output and inputs, so the
+        # final merge lands in fp32 and is cast once.
+        out = torch.empty(q_len, Hq, D, device=device, dtype=torch.float32)
+        merge_attn_states(out, acc_o, acc_lse, suffix_o.float(), suffix_lse)
+        return out.to(qdtype)
 
     # ------------------------------------------------------------------ #
     #  Decode: Triton TQ decode attention                                 #
