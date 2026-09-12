@@ -520,9 +520,15 @@ class Worker(WorkerBase):
         zero), and the budget subtracts it here, before auto-fit sizes the
         context.
 
-        The walk mirrors `get_kv_cache_spec`: every backend shares one workspace
-        buffer per `(ubatch, lane)` slot, so the cost is the largest declaration
-        times the number of slots, not the sum over layers.
+        The walk mirrors `get_kv_cache_spec`, and the aggregation has two levels
+        because the backends differ in what they share. Within one backend class
+        the buffer is shared across layers and groups -- FlashInfer hands its
+        workspace to every builder, TurboQuant's builders all grow one manager
+        workspace -- so a class costs the largest of its layers' declarations,
+        not their sum. Across classes, a hybrid model running two backends has
+        two independent allocations, so those add. Any per-slot multiplication
+        belongs inside the backend's own declaration, since only it knows whether
+        it draws from the shared workspace manager.
         """
         try:
             from vllm.config import get_layers_from_vllm_config
@@ -530,17 +536,14 @@ class Worker(WorkerBase):
                 AttentionLayerBase,
             )
             from vllm.v1.kv_cache_interface import AttentionSpec
-            from vllm.v1.worker.workspace import (
-                current_workspace_manager,
-                is_workspace_manager_initialized,
-            )
+            from vllm.v1.worker.workspace import is_workspace_manager_initialized
         except ImportError:  # pragma: no cover
             return 0
 
         if not is_workspace_manager_initialized():
             return 0
 
-        per_slot = 0
+        per_backend: dict[type, int] = {}
         layers = get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase)
         for layer in layers.values():
             if getattr(layer, "kv_sharing_target_layer_name", None):
@@ -554,12 +557,10 @@ class Worker(WorkerBase):
             # for TurboQuant that is where the packed slot width is set.
             if isinstance(spec, AttentionSpec):
                 spec = backend.customize_spec(spec)
-            per_slot = max(
-                per_slot, backend.get_reserved_workspace_bytes(self.vllm_config, spec)
-            )
+            declared = backend.get_reserved_workspace_bytes(self.vllm_config, spec)
+            per_backend[backend] = max(per_backend.get(backend, 0), declared)
 
-        num_slots = len(current_workspace_manager().sizes())
-        return per_slot * max(1, num_slots)
+        return sum(per_backend.values())
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:

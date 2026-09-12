@@ -418,6 +418,37 @@ class FlashInferBackend(AttentionBackend):
         "nvfp4_4over6",
     ]
 
+    @classmethod
+    def get_reserved_workspace_bytes(
+        cls, vllm_config: "VllmConfig", kv_cache_spec: "AttentionSpec"
+    ) -> int:
+        """The shared workspace, which is allocated after profiling ends.
+
+        `init_attn_backend` takes it from the first builder and hands the same
+        buffer to every other one, so it is declared once per backend rather than
+        once per group -- and it runs after the KV cache is allocated, which is
+        what makes it invisible to the budget no matter how careful the profiling
+        window is.
+
+        Only this buffer is declared. The trtllm workspace is a separate
+        allocation of the same nominal size, but it is taken inside `forward`,
+        so the dummy run pays for it and it already lands in peak activation;
+        declaring that one too would double-count it.
+
+        The head count is the model-wide one, which is the same fallback the
+        builder uses when a group has no per-layer count. A model whose per-layer
+        count exceeded the model-wide value would be under-declared here, which
+        is the pre-existing behaviour rather than a new failure.
+        """
+        num_qo_heads = vllm_config.model_config.get_num_attention_heads(
+            vllm_config.parallel_config
+        )
+        return _workspace_buffer_bytes(
+            vllm_config.scheduler_config.max_num_batched_tokens,
+            num_qo_heads,
+            kv_cache_spec.head_size,
+        )
+
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
         # Page sizes >= 128 only run on the trtllm-gen dynamic kernel (GQA/MQA
@@ -665,6 +696,33 @@ class FlashInferMetadata:
     """
 
     cascade_wrapper: MultiLevelCascadeAttentionWrapper | None
+
+
+def _workspace_buffer_bytes(
+    max_num_batched_tokens: int, num_qo_heads: int, head_dim: int
+) -> int:
+    """Size of the shared FlashInfer workspace.
+
+    FlashInfer prefill temp buffers (batch_prefill_tmp_v, ...) scale with the
+    prefill chunk and query-head footprint, NOT context length. The fixed ~394 MiB
+    default is too small for wide-head models at the default 8192-token chunk on
+    some archs (e.g. sm_120), where FlashInfer hard-errors instead of growing.
+    Size to the batch's head footprint; never shrink below the configured default.
+
+    Split out from `_get_workspace_buffer` so the KV budget can price this buffer
+    before any builder exists -- see `FlashInferBackend.get_reserved_workspace_bytes`.
+    One expression, two callers: a declaration that drifts from the allocation
+    would be worse than none.
+    """
+    if envs.VLLM_BATCH_INVARIANT:
+        return FLASHINFER_WORKSPACE_BUFFER_SIZE_BATCH_INVARIANT
+    est = (
+        max_num_batched_tokens
+        * num_qo_heads
+        * head_dim
+        * FLASHINFER_PREFILL_WORKSPACE_BYTES_PER_ELEM
+    )
+    return max(envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE, est)
 
 
 class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
@@ -1016,26 +1074,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
 
     def _get_workspace_buffer(self):
         if self._workspace_buffer is None:
-            buffer_size = envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE
-            if envs.VLLM_BATCH_INVARIANT:
-                buffer_size = FLASHINFER_WORKSPACE_BUFFER_SIZE_BATCH_INVARIANT
-            else:
-                # FlashInfer prefill temp buffers (batch_prefill_tmp_v, ...)
-                # scale with the prefill chunk and query-head footprint, NOT
-                # context length. The fixed ~394 MiB default is too small for
-                # wide-head models at the default 8192-token chunk on some
-                # archs (e.g. sm_120), where FlashInfer hard-errors instead of
-                # growing. Size to the batch's head footprint; never shrink
-                # below the configured default.
-                est = (
-                    self.max_num_batched_tokens
-                    * self.num_qo_heads
-                    * self.head_dim
-                    * FLASHINFER_PREFILL_WORKSPACE_BYTES_PER_ELEM
-                )
-                buffer_size = max(buffer_size, est)
             self._workspace_buffer = torch.zeros(
-                buffer_size, dtype=torch.uint8, device=self.device
+                _workspace_buffer_bytes(
+                    self.max_num_batched_tokens, self.num_qo_heads, self.head_dim
+                ),
+                dtype=torch.uint8,
+                device=self.device,
             )
         return self._workspace_buffer
 

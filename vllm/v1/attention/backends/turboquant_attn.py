@@ -190,8 +190,12 @@ class TurboQuantAttentionBackend(AttentionBackend):
         The manager grows one buffer per slot to the largest *simultaneous*
         request, so the cost is the maximum over reservation sets rather than
         their sum, and `get_simultaneous` aligns each view in a set to 256 bytes.
+        The slot count is applied here rather than by the caller, because only
+        this backend knows it draws from the shared manager at all: under
+        dual-batch overlap there are two ubatch slots and the reserve is paid
+        twice.
         """
-        return max(
+        per_slot = max(
             (
                 sum(
                     round_up(math.prod(shape) * dtype.itemsize, 256)
@@ -203,6 +207,9 @@ class TurboQuantAttentionBackend(AttentionBackend):
             ),
             default=0,
         )
+        if not per_slot or not is_workspace_manager_initialized():
+            return per_slot
+        return per_slot * max(1, len(current_workspace_manager().sizes()))
 
     @classmethod
     def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
