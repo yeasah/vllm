@@ -182,6 +182,29 @@ class TurboQuantAttentionBackend(AttentionBackend):
         return TurboQuantMetadataBuilder
 
     @classmethod
+    def get_reserved_workspace_bytes(
+        cls, vllm_config, kv_cache_spec: AttentionSpec
+    ) -> int:
+        """Price the builder's reservations for the KV budget, per workspace slot.
+
+        The manager grows one buffer per slot to the largest *simultaneous*
+        request, so the cost is the maximum over reservation sets rather than
+        their sum, and `get_simultaneous` aligns each view in a set to 256 bytes.
+        """
+        return max(
+            (
+                sum(
+                    round_up(math.prod(shape) * dtype.itemsize, 256)
+                    for shape, dtype in reservation
+                )
+                for reservation in _workspace_reservation_sets(
+                    vllm_config, kv_cache_spec
+                )
+            ),
+            default=0,
+        )
+
+    @classmethod
     def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
         if kv_cache_dtype is None:
             return False
@@ -192,6 +215,78 @@ class TurboQuantAttentionBackend(AttentionBackend):
         # head_size from spec is effective_head_size (padded_slot//2),
         # not the model's actual head_dim. Accept any positive value.
         return head_size > 0
+
+
+def _workspace_reservation_sets(
+    vllm_config, kv_cache_spec: AttentionSpec
+) -> list[tuple[tuple[tuple[int, ...], torch.dtype], ...]]:
+    """Every simultaneous reservation `TurboQuantMetadataBuilder` will make.
+
+    One expression, two callers: the builder hands each set to the workspace
+    manager, and `TurboQuantAttentionBackend.get_reserved_workspace_bytes`
+    prices the same sets for the KV budget, which is computed before any builder
+    exists. They live together deliberately -- a declaration that drifts from the
+    allocation is worse than no declaration at all, because then the budget is
+    confidently wrong rather than merely blind.
+    """
+    scheduler_config = vllm_config.scheduler_config
+    model_config = vllm_config.model_config
+    parallel_config = vllm_config.parallel_config
+
+    max_num_reqs = scheduler_config.max_num_seqs
+    num_heads = model_config.get_num_attention_heads(parallel_config)
+    num_kv_heads = kv_cache_spec.num_kv_heads
+    head_size = kv_cache_spec.head_size
+    max_num_splits = vllm_config.attention_config.tq_max_kv_splits_for_cuda_graph
+
+    sets: list[tuple[tuple[tuple[int, ...], torch.dtype], ...]] = [
+        (
+            ((max_num_reqs, num_heads, max_num_splits, head_size + 1), torch.float32),
+            ((max_num_reqs, num_heads, head_size), model_config.dtype),
+            ((max_num_reqs, num_heads), torch.float32),
+        )
+    ]
+
+    reserve_continuation_prefill = (
+        scheduler_config.enable_chunked_prefill
+        and scheduler_config.max_num_batched_tokens > _CONTINUATION_DECODE_THRESHOLD
+    )
+    if not reserve_continuation_prefill:
+        return sets
+
+    max_cached_len = max(0, model_config.max_model_len - 1)
+    alloc_len = round_up(max_cached_len, kv_cache_spec.block_size)
+    cache_buf_shape = (1, num_kv_heads, alloc_len, head_size)
+
+    budget = max(0, vllm_config.attention_config.tq_prefill_workspace_mib) * 1024 * 1024
+    if budget and _HAS_FLASH_ATTN:
+        # Cap by what a slab covering the whole declared context would
+        # cost, so a short context reserves less than the budget allows.
+        # The cap has to be priced in the *chunked* layout, not the
+        # monolithic one: that layout carries two more buffers per token
+        # (the rotated keys, and the copy laid out for flash-attention),
+        # so pricing the cap the monolithic way would under-reserve for
+        # any model whose declared context lands between the two, and
+        # the first long prefill would hit the workspace lock. The spec's
+        # head_size only ever overstates the impl's, and the rotated
+        # buffer is counted even for fp8 keys, which do not have one.
+        chunked_bytes = (
+            alloc_len
+            * num_kv_heads
+            * head_size
+            * (2 * 2 + 2 + 2 * model_config.dtype.itemsize)
+        )
+        # Slack covers get_simultaneous' 256-byte alignment per buffer.
+        sets.append(((((min(budget, chunked_bytes) + 2048,)), torch.uint8),))
+        return sets
+
+    sets.append(
+        (
+            (cache_buf_shape, torch.float16),
+            (cache_buf_shape, torch.float16),
+        )
+    )
+    return sets
 
 
 @dataclass
@@ -229,68 +324,10 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
         if not is_workspace_manager_initialized():
             return
 
-        scheduler_config = self.vllm_config.scheduler_config
-        model_config = self.vllm_config.model_config
-        parallel_config = self.vllm_config.parallel_config
-
-        max_num_reqs = scheduler_config.max_num_seqs
-        num_heads = model_config.get_num_attention_heads(parallel_config)
-        num_kv_heads = self.kv_cache_spec.num_kv_heads
-        head_size = self.kv_cache_spec.head_size
-        max_num_splits = (
-            self.vllm_config.attention_config.tq_max_kv_splits_for_cuda_graph
-        )
-
-        current_workspace_manager().get_simultaneous(
-            ((max_num_reqs, num_heads, max_num_splits, head_size + 1), torch.float32),
-            ((max_num_reqs, num_heads, head_size), model_config.dtype),
-            ((max_num_reqs, num_heads), torch.float32),
-        )
-
-        reserve_continuation_prefill = (
-            scheduler_config.enable_chunked_prefill
-            and scheduler_config.max_num_batched_tokens > _CONTINUATION_DECODE_THRESHOLD
-        )
-        if not reserve_continuation_prefill:
-            return
-
-        max_cached_len = max(0, model_config.max_model_len - 1)
-        alloc_len = round_up(max_cached_len, self.kv_cache_spec.block_size)
-        cache_buf_shape = (1, num_kv_heads, alloc_len, head_size)
-        # The chunked path sizes its buffers by the slab, so its reservation is
-        # a byte budget and not a shape: it carves its own views out of this,
-        # from its own head_size, which the spec's padded one only ever
-        # over-states. Reserving by bytes is what keeps the two sides from
-        # having to agree on a token count derived from different dimensions.
-        budget = (
-            max(0, self.vllm_config.attention_config.tq_prefill_workspace_mib)
-            * 1024
-            * 1024
-        )
-        if budget and _HAS_FLASH_ATTN:
-            # Cap by what a slab covering the whole declared context would
-            # cost, so a short context reserves less than the budget allows.
-            # The cap has to be priced in the *chunked* layout, not the
-            # monolithic one: that layout carries two more buffers per token
-            # (the rotated keys, and the copy laid out for flash-attention),
-            # so pricing the cap the monolithic way would under-reserve for
-            # any model whose declared context lands between the two, and
-            # the first long prefill would hit the workspace lock. The spec's
-            # head_size only ever overstates the impl's, and the rotated
-            # buffer is counted even for fp8 keys, which do not have one.
-            chunked_bytes = alloc_len * num_kv_heads * head_size * (
-                2 * 2 + 2 + 2 * model_config.dtype.itemsize
-            )
-            # Slack covers get_simultaneous' 256-byte alignment per buffer.
-            current_workspace_manager().get_simultaneous(
-                (((min(budget, chunked_bytes) + 2048,)), torch.uint8),
-            )
-            return
-
-        current_workspace_manager().get_simultaneous(
-            (cache_buf_shape, torch.float16),
-            (cache_buf_shape, torch.float16),
-        )
+        for reservation in _workspace_reservation_sets(
+            self.vllm_config, self.kv_cache_spec
+        ):
+            current_workspace_manager().get_simultaneous(*reservation)
 
     def build_for_cudagraph_capture(
         self, common_attn_metadata: CommonAttentionMetadata
