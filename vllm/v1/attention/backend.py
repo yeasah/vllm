@@ -93,6 +93,25 @@ class AttentionBackend(ABC):
         return (cls.__module__, cls.__qualname__)
 
     @classmethod
+    def get_reserved_workspace_bytes(
+        cls, vllm_config: "VllmConfig", kv_cache_spec: "AttentionSpec"
+    ) -> int:
+        """Shared-workspace bytes this backend reserves *after* profiling ends.
+
+        The memory profiler measures a window that closes before the metadata
+        builders exist, so anything a builder reserves is invisible to the KV
+        budget and is spent from whatever the utilization knob happened to leave
+        behind. A backend that reserves in its builder returns those bytes here
+        and the budget subtracts them, which is what lets
+        `gpu_memory_utilization` mean what it says.
+
+        Return the high-water mark, not the sum: the workspace manager grows one
+        buffer to the largest simultaneous request, so several reservations cost
+        the largest of them. Backends that reserve nothing keep the default.
+        """
+        return 0
+
+    @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
         return []
 

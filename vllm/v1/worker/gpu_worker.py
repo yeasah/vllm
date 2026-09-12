@@ -509,6 +509,58 @@ class Worker(WorkerBase):
         with set_current_vllm_config(self.vllm_config):
             self.model_runner.reload_weights(*args, **kwargs)
 
+    def _reserved_workspace_bytes(self) -> int:
+        """What the attention backends will take from the shared workspace after
+        the profiling window closes.
+
+        The profiler measures a window that ends before any metadata builder
+        exists, so a builder's reservation is spent from whatever the utilization
+        knob left unclaimed -- which is why `gpu_memory_utilization` could not be
+        set to the card's real maximum. Backends declare it instead (default
+        zero), and the budget subtracts it here, before auto-fit sizes the
+        context.
+
+        The walk mirrors `get_kv_cache_spec`: every backend shares one workspace
+        buffer per `(ubatch, lane)` slot, so the cost is the largest declaration
+        times the number of slots, not the sum over layers.
+        """
+        try:
+            from vllm.config import get_layers_from_vllm_config
+            from vllm.model_executor.layers.attention_layer_base import (
+                AttentionLayerBase,
+            )
+            from vllm.v1.kv_cache_interface import AttentionSpec
+            from vllm.v1.worker.workspace import (
+                current_workspace_manager,
+                is_workspace_manager_initialized,
+            )
+        except ImportError:  # pragma: no cover
+            return 0
+
+        if not is_workspace_manager_initialized():
+            return 0
+
+        per_slot = 0
+        layers = get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase)
+        for layer in layers.values():
+            if getattr(layer, "kv_sharing_target_layer_name", None):
+                continue
+            spec = layer.get_kv_cache_spec(self.vllm_config)
+            if spec is None:
+                continue
+            backend = layer.get_attn_backend()
+            # Price the spec the builder will actually see: `get_kv_cache_spec`
+            # passes attention specs through the backend's `customize_spec`, and
+            # for TurboQuant that is where the packed slot width is set.
+            if isinstance(spec, AttentionSpec):
+                spec = backend.customize_spec(spec)
+            per_slot = max(
+                per_slot, backend.get_reserved_workspace_bytes(self.vllm_config, spec)
+            )
+
+        num_slots = len(current_workspace_manager().sizes())
+        return per_slot * max(1, num_slots)
+
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
         """Profiles the peak memory usage of the model to determine how much
@@ -603,11 +655,19 @@ class Worker(WorkerBase):
         )
         self.cudagraph_memory_estimate = cudagraph_memory_estimate
 
+        reserved_workspace = self._reserved_workspace_bytes()
         self.available_kv_cache_memory_bytes = (
             self.requested_memory
             - profile_result.non_kv_cache_memory
             - cudagraph_memory_estimate_applied
+            - reserved_workspace
         )
+        if reserved_workspace:
+            logger.info_once(
+                "Attention backends declare %.2f MiB of workspace reserved after "
+                "profiling; subtracted from the KV budget.",
+                reserved_workspace / (1024**2),
+            )
 
         unrequested_memory = self.init_snapshot.free_memory - self.requested_memory
         logger.debug(
