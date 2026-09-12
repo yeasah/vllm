@@ -48,6 +48,7 @@ from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
 from vllm.v1.worker.ubatch_utils import check_ubatch_thresholds, get_num_ubatches
 from vllm.v1.worker.utils import AttentionGroup, clear_layer_kv_caches
+from vllm.v1.worker.workspace import shrink_workspace_to, workspace_sizes
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
@@ -901,6 +902,11 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
     # pool and then discarded would drop its use_count to 0, tripping the c10
     # allocator's create_or_incref_pool assert when the real capture reuses
     # that pool ("use_count > 0 INTERNAL ASSERT FAILED").
+
+    # Everything the profiling phase allocates from the workspace is discarded
+    # with it; see `workspace_sizes`.
+    entry_workspace_sizes = workspace_sizes()
+
     platform_cls = type(current_platform)
     saved_global_pool = platform_cls._global_graph_pool
     throwaway_pool = current_platform.graph_pool_handle()
@@ -971,7 +977,7 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
             # Drop local references before teardown detaches the runner's
             # manager and flushes the allocator.
             del manager
-            _teardown_profiling_state(runner)
+            _teardown_profiling_state(runner, entry_workspace_sizes)
     finally:
         platform_cls._global_graph_pool = saved_global_pool
 
@@ -1014,7 +1020,9 @@ def _init_minimal_kv_cache_for_profiling(runner: "GPUModelRunner") -> None:
     runner.cache_config.num_gpu_blocks = minimal_config.num_blocks
 
 
-def _teardown_profiling_state(runner: "GPUModelRunner") -> None:
+def _teardown_profiling_state(
+    runner: "GPUModelRunner", entry_workspace_sizes: list[int]
+) -> None:
     """Release the profiling KV cache and captured graphs while keeping model
     weights, so the real ``initialize_kv_cache`` starts from a clean slate."""
     torch.accelerator.synchronize()
@@ -1049,5 +1057,8 @@ def _teardown_profiling_state(runner: "GPUModelRunner") -> None:
     release_hisparse_profiling_cache(runner.compilation_config.static_forward_context)
     runner.cache_config.num_gpu_blocks = None
     runner.maybe_remove_all_loras(runner.lora_config)
+    # The builders died with `attn_groups`; their workspace reservation, sized
+    # from a pre-auto-fit `max_model_len`, would outlive them otherwise.
+    shrink_workspace_to(entry_workspace_sizes)
     gc.collect()
     torch.accelerator.empty_cache()
