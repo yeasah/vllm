@@ -50,6 +50,25 @@ class AttentionConfig:
     Fixes the split count so grid dimensions are constant across captures,
     and buffers can be pre-allocated to avoid inflating the memory estimate."""
 
+    tq_prefill_workspace_mib: int = 96
+    """TurboQuant continuation-prefill dequant workspace budget, in MiB.
+
+    A continuation chunk attends to every cached token, so the cached K/V has
+    to be dequantized out of the compressed cache first. Doing that in one
+    piece makes prefill VRAM scale with context; slicing the cached prefix into
+    slabs and merging the partial attentions by log-sum-exp makes it scale with
+    this budget instead, at a few percent of the attention time.
+
+    The budget is in bytes rather than tokens because the token count follows
+    the model -- `num_kv_heads` x `head_size` x the slab buffers -- so a token
+    figure would export that arithmetic to whoever sets it. The slab is rounded
+    down to a whole number of KV blocks and never exceeds what `max_model_len`
+    could cache, so a short context reserves less than the budget allows.
+
+    Set to 0 to dequantize the whole cached context in one piece, which is the
+    only path available when flash-attention is not (the merge needs its
+    log-sum-exp output). That restores VRAM scaling with `max_model_len`."""
+
     use_trtllm_attention: bool | None = None
     """If set to True/False, use or don't use the TRTLLM attention backend
     in flashinfer. If None, auto-detect the attention backend in flashinfer."""
