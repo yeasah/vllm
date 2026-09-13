@@ -425,11 +425,16 @@ class Qwen2_5_VisionAttention(nn.Module):
             qk_reshaped = einops.rearrange(
                 qk, "b s two head head_dim -> (two b) s head head_dim", two=2
             )
-            qk_reshaped = qk_reshaped.contiguous()
-            qk_rotated = self.apply_rotary_emb(
+            from vllm.vllm_flash_attn.layers.rotary import (
+                apply_rotary_emb as _are,
+            )
+
+            qk_rotated = _are(
                 qk_reshaped,
                 rotary_pos_emb_cos,
                 rotary_pos_emb_sin,
+                interleaved=False,
+                inplace=True,
             )
             qk_rotated = qk_rotated.view(
                 2,

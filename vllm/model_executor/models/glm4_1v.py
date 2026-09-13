@@ -358,14 +358,20 @@ class Glm4vVisionAttention(nn.Module):
         # [s, b, 3 * head * head_dim] -> 3 * [s, b, head, head_dim]
         q, k, v = self.split_qkv(x)
 
-        q, k, v = (rearrange(x, "s b ... -> b s ...").contiguous() for x in (q, k, v))
+        q, k, v = (rearrange(x, "s b ... -> b s ...") for x in (q, k, v))
         if rotary_pos_emb_cos is not None and rotary_pos_emb_sin is not None:
+            from vllm.vllm_flash_attn.layers.rotary import (
+                apply_rotary_emb as _are,
+            )
+
             # [2 * b, s, heads, head_dim]
             qk_concat = torch.cat([q, k], dim=0)
-            qk_rotated = self.apply_rotary_emb(
+            qk_rotated = _are(
                 qk_concat,
                 rotary_pos_emb_cos,
                 rotary_pos_emb_sin,
+                interleaved=False,
+                inplace=True,
             )
             q, k = torch.chunk(qk_rotated, 2, dim=0)
 
