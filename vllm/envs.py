@@ -330,6 +330,7 @@ if TYPE_CHECKING:
     VLLM_WEIGHT_OFFLOADING_DISABLE_UVA: bool = False
     VLLM_RELOAD_MODE: Literal["layerwise", "direct"] = "layerwise"
     VLLM_KV_OFFLOAD_MAX_BATCH_DESCRIPTORS: int = 0
+    VLLM_MM_ENCODER_MLP_CHUNK_MB: int = 256
     VLLM_WSL2_ENABLE_PIN_MEMORY: bool = False
     VLLM_DISABLE_LOG_LOGO: bool = False
     VLLM_LORA_DISABLE_PDL: bool = False
@@ -2302,6 +2303,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tensors and reruns post-load processing in place.
     "VLLM_RELOAD_MODE": env_with_choices(
         "VLLM_RELOAD_MODE", "layerwise", ["layerwise", "direct"]
+    ),
+    # Byte budget (MiB) for a vision-tower MLP's live activations. The MLP is
+    # pointwise over the token dimension, so it is sliced into row-chunks sized
+    # to fit this budget, bounding a transient that otherwise scales with the
+    # image's patch count. Bit-for-bit identical to the unchunked forward.
+    # 0 disables chunking and restores the original single-shot behaviour.
+    "VLLM_MM_ENCODER_MLP_CHUNK_MB": lambda: int(
+        os.getenv("VLLM_MM_ENCODER_MLP_CHUNK_MB", "256")
     ),
     # Max descriptors per CPU-KV-offload batch-memcpy call. 0 = platform default
     # (ROCm chunks at 8192, since hipMemcpyBatchAsync faults above that on
