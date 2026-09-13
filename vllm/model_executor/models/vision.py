@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 from transformers import PretrainedConfig
 
+import vllm.envs as envs
 from vllm.config import ModelConfig, MultiModalConfig, get_current_vllm_config_or_none
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
@@ -731,3 +732,76 @@ class FusedInputNorm(nn.Module):
             1, self.channel, 1
         )
         return x.view(patches, size).to(visual_dtype)
+
+
+def mm_encoder_mlp_chunk_rows(
+    hidden_features: int,
+    *,
+    live_widths: int = 3,
+    dtype_size: int = 2,
+) -> int:
+    """Rows per chunk for a pointwise vision-tower MLP, from a byte budget.
+
+    A vision tower's MLP is pointwise over the token dimension, so its live
+    activations are `live_widths * hidden_features` elements per input row and
+    scale with the image's patch count -- 3.76 GiB for one GLM-4.1V layer at
+    full resolution. Slicing the forward into row-chunks bounds that without
+    changing the result.
+
+    The chunk is derived from `VLLM_MM_ENCODER_MLP_CHUNK_MB` rather than being a
+    row count, so one budget holds across architectures whose intermediate sizes
+    differ by 3x (so400m's 4304 against GLM-4.1V's 13696, gated to 27392).
+
+    Args:
+        hidden_features: The MLP's intermediate width.
+        live_widths: Multiples of `hidden_features` live at the peak. 3 covers
+            both the plain form (projection output plus activation output) and
+            the gated form, whose fused projection is already `2 x` wide.
+        dtype_size: Bytes per element of the activation dtype.
+
+    Returns:
+        Rows per chunk, or 0 to leave the forward unchunked.
+    """
+    budget = envs.VLLM_MM_ENCODER_MLP_CHUNK_MB * 1024 * 1024
+    if budget <= 0:
+        return 0
+    return max(1, budget // (live_widths * hidden_features * dtype_size))
+
+
+def chunked_pointwise_mlp(
+    mlp_fn: Callable[[torch.Tensor], torch.Tensor],
+    x: torch.Tensor,
+    chunk_rows: int,
+) -> torch.Tensor:
+    """Apply a shape-preserving pointwise MLP in row-chunks.
+
+    Exactly equivalent to `mlp_fn(x)` -- every row is independent, so slicing the
+    token dimension changes no arithmetic and the result is bit-for-bit identical.
+    Only the peak footprint changes.
+
+    Skipped while tracing: a Python loop here would unroll into the compiled
+    graph, so a compiled encoder keeps the single-shot form it has today.
+
+    Args:
+        mlp_fn: Pointwise over dim 0, returning the same shape it is given.
+        x: `[rows, in_features]` activations.
+        chunk_rows: Rows per chunk; <= 0 or >= rows applies `mlp_fn` in one shot.
+    """
+    rows = x.shape[0]
+    if chunk_rows <= 0 or rows <= chunk_rows or torch.compiler.is_compiling():
+        logger.debug_once(
+            "vision MLP unchunked: %d rows, chunk_rows=%d", rows, chunk_rows
+        )
+        return mlp_fn(x)
+
+    logger.info_once(
+        "Chunking vision MLP: %d rows in %d chunks of <=%d",
+        rows,
+        -(-rows // chunk_rows),
+        chunk_rows,
+    )
+    out = torch.empty_like(x)
+    for start in range(0, rows, chunk_rows):
+        stop = start + chunk_rows
+        out[start:stop] = mlp_fn(x[start:stop])
+    return out

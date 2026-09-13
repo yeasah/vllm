@@ -154,7 +154,9 @@ from .utils import (
     maybe_prefix,
 )
 from .vision import (
+    chunked_pointwise_mlp,
     get_fp8_padded_hidden_size,
+    mm_encoder_mlp_chunk_rows,
     get_vit_attn_backend,
     is_vit_use_data_parallel,
     run_dp_sharded_mrope_vision_model,
@@ -429,10 +431,13 @@ class Qwen3_VisionMLP(nn.Module):
             disable_tp=use_data_parallel,
         )
         self.act_fn = act_fn
+        self.chunk_rows = mm_encoder_mlp_chunk_rows(hidden_features)
+
+    def _mlp(self, x: torch.Tensor) -> torch.Tensor:
+        return self.linear_fc2(self.act_fn(self.linear_fc1(x)))
 
     def forward(self, x: torch.Tensor):
-        mlp_output = self.linear_fc2(self.act_fn(self.linear_fc1(x)))
-        return mlp_output
+        return chunked_pointwise_mlp(self._mlp, x, self.chunk_rows)
 
 
 @support_torch_compile(

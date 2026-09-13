@@ -121,7 +121,9 @@ from .utils import (
     maybe_prefix,
 )
 from .vision import (
+    chunked_pointwise_mlp,
     get_vit_attn_backend,
+    mm_encoder_mlp_chunk_rows,
     is_vit_use_data_parallel,
     run_dp_sharded_mrope_vision_model,
 )
@@ -242,12 +244,16 @@ class Glm4vVisionMLP(nn.Module):
             disable_tp=use_data_parallel,
         )
         self.act_fn = SiluAndMul()
+        self.chunk_rows = mm_encoder_mlp_chunk_rows(hidden_features)
 
-    def forward(self, x: torch.Tensor):
+    def _mlp(self, x: torch.Tensor) -> torch.Tensor:
         x, _ = self.gate_up_proj(x)
         x = self.act_fn(x)
         x, _ = self.down_proj(x)
         return x
+
+    def forward(self, x: torch.Tensor):
+        return chunked_pointwise_mlp(self._mlp, x, self.chunk_rows)
 
 
 def all_gather_interleave(local_tensor, hidden_size: int, tp_size: int):
