@@ -380,7 +380,11 @@ class ReplicatedLinear(LinearBase):
             self.input_size,
             self.output_size,
             self.params_dtype,
-            weight_loader=self.weight_loader,
+            weight_loader=(
+                self.weight_loader_v2
+                if self.quant_method.__class__.__name__ in WEIGHT_LOADER_V2_SUPPORTED
+                else self.weight_loader
+            ),
         )
 
         if bias:
@@ -407,6 +411,28 @@ class ReplicatedLinear(LinearBase):
             f"to a parameter of size {param.size()}"
         )
         param.data.copy_(loaded_weight)
+
+    def weight_loader_v2(self, param: BasevLLMParameter, loaded_weight: torch.Tensor):
+        # Special case for loading scales off disk, which often do not
+        # have a shape (such as in the case of AutoFP8).
+        if len(loaded_weight.shape) == 0:
+            assert loaded_weight.numel() == 1
+            loaded_weight = loaded_weight.reshape(1)
+
+        # A replicated layer partitions nothing, so the weight is loaded whole,
+        # on every rank. vLLM's own row parameters (`RowvLLMParameter`, and so
+        # `ModelWeightParameter`, the unquantized weight, and the packed ones)
+        # narrow along input_dim by TP rank in `load_row_parallel_weight`: rank 0
+        # got its own whole tensor back and every other rank failed (a bf16 MoE
+        # router at TP=2: "start (2048) + length (2048) exceeds dimension size
+        # (2048)"). Those load whole here. Every other parameter keeps its own
+        # `load_row_parallel_weight` -- whole-tensor on the base class, and a
+        # quantization plugin's parameter applies its own policy there (an EXL3
+        # one holds no preallocated data at all, so a shape check fails it).
+        if isinstance(param, RowvLLMParameter):
+            BasevLLMParameter._assert_and_load(param, loaded_weight)
+        else:
+            param.load_row_parallel_weight(loaded_weight=loaded_weight)
 
     def forward(
         self,
