@@ -411,11 +411,14 @@ class ReplicatedLinear(LinearBase):
             assert loaded_weight.numel() == 1
             loaded_weight = loaded_weight.reshape(1)
 
-        # A replicated layer partitions nothing, so the weight is loaded whole.
-        # `BasevLLMParameter.load_row_parallel_weight` is that no-narrowing
-        # load -- the same entry point `PerTensorScaleParameter` relies on for
-        # exactly this reason ("for row parallel layers, no sharding needed").
-        param.load_row_parallel_weight(loaded_weight=loaded_weight)
+        # A replicated layer partitions nothing, so the weight is loaded whole,
+        # on every rank. Not through `load_row_parallel_weight`: that is
+        # whole-tensor only on the base class, while `ModelWeightParameter` (the
+        # unquantized weight) and the packed/grouped parameters narrow it along
+        # input_dim by TP rank -- rank 0 got its own whole tensor back and every
+        # other rank failed (a bf16 MoE router at TP=2: "start (2048) + length
+        # (2048) exceeds dimension size (2048)").
+        BasevLLMParameter._assert_and_load(param, loaded_weight)
 
     def forward(
         self,
