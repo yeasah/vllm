@@ -129,6 +129,13 @@ class MuseGlimmerTextConfig(PreTrainedConfig):
 
 class MuseGlimmerVisionConfig(PreTrainedConfig):
     model_type = "muse_glimmer_vision"
+    # transformers >= 5.17 builds the vision rotary embedding only for rope_type
+    # "axial", and its own config class maps the checkpoint's "default" to that
+    # through this attribute (standardize_rope_params). This vendored class
+    # replaces transformers' in AutoConfig, so without it the Transformers backend
+    # fails: "MuseGlimmerVisionRotaryEmbedding supports only axial rope, but
+    # requested default". Upstream drops the vendored class in 19997aac51.
+    default_rope_type = "axial"
 
     def __init__(
         self,
