@@ -97,6 +97,110 @@ class DisabledTqdm(tqdm):
         super().__init__(*args, **kwargs)
 
 
+# Download reporting (appliance fork). snapshot_download runs with its progress bars disabled (DisabledTqdm, so
+# several processes do not draw over each other), which left a download -- tens of GiB when a checkpoint is
+# republished -- with no output at all until it finished. Upstream declined a progress bar (#21191); these log
+# lines instead: a lead-in once a download has run for a few seconds, its progress every interval, and a line when
+# a process waits on another's download lock.
+_DOWNLOAD_QUIET_S = 3.0
+_DOWNLOAD_EVERY_S = 10.0
+
+
+def _blob_bytes(blobs: str) -> int:
+    """Bytes in a repo's cache blob directory, partial (.incomplete) files included: both of huggingface_hub's
+    backends (HTTP and Xet) write the file being fetched there."""
+    total = 0
+    try:
+        with os.scandir(blobs) as it:
+            for entry in it:
+                try:
+                    total += entry.stat(follow_symlinks=False).st_size
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return total
+
+
+def _expected_download(repo_id: str, revision: str | None, allow_patterns, blobs: str) -> tuple[int, int] | None:
+    """(bytes, files) still to fetch for these patterns, from the Hub's file metadata; None if unknown"""
+    import fnmatch
+
+    try:
+        info = hf_api().model_info(repo_id, revision=revision, files_metadata=True)
+    except Exception:
+        return None
+    pats = allow_patterns if isinstance(allow_patterns, (list, tuple)) else [allow_patterns]
+    want, files = 0, 0
+    for sib in info.siblings or []:
+        if not any(fnmatch.fnmatch(sib.rfilename, p) or sib.rfilename == p for p in pats):
+            continue
+        blob = (sib.lfs.sha256 if sib.lfs else None) or sib.blob_id
+        if blob and os.path.exists(os.path.join(blobs, blob)):
+            continue
+        want += sib.size or 0
+        files += 1
+    return want, files
+
+
+@contextmanager
+def _report_download(repo_id: str, revision: str | None, allow_patterns, cache_dir: str | None):
+    """Log a snapshot_download's progress if it runs longer than a few seconds; silent when it is all cached."""
+    import threading
+
+    from huggingface_hub.file_download import repo_folder_name
+
+    blobs = os.path.join(
+        cache_dir or huggingface_hub.constants.HF_HUB_CACHE,
+        repo_folder_name(repo_id=repo_id, repo_type="model"),
+        "blobs",
+    )
+    done = threading.Event()
+    name = f"{repo_id}@{revision or 'main'}"
+
+    def watch():
+        if done.wait(_DOWNLOAD_QUIET_S):
+            return
+        start, t0 = _blob_bytes(blobs), time.perf_counter()
+        expected = _expected_download(repo_id, revision, allow_patterns, blobs)
+        if expected and expected[0]:
+            logger.info("Downloading %s: %d files, %.2f GiB to fetch", name, expected[1], expected[0] / 2**30)
+        else:
+            logger.info("Downloading %s (size unknown)", name)
+        while not done.wait(_DOWNLOAD_EVERY_S):
+            got = max(_blob_bytes(blobs) - start, 0)
+            rate = got / max(time.perf_counter() - t0, 1e-6)
+            if expected and expected[0]:
+                logger.info("Downloading %s: %.2f of %.2f GiB (%.0f%%), %.0f MB/s", name, got / 2**30,
+                            expected[0] / 2**30, 100 * min(got / expected[0], 1.0), rate / 1e6)
+            else:
+                logger.info("Downloading %s: %.2f GiB so far, %.0f MB/s", name, got / 2**30, rate / 1e6)
+
+    thread = threading.Thread(target=watch, name="vllm-download-report", daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        done.set()
+        thread.join(timeout=1.0)
+
+
+@contextmanager
+def _download_lock(model_name_or_path, cache_dir: str | None):
+    """get_lock, saying so when another process holds it: a process waiting on another's download was silent too"""
+    lock = get_lock(model_name_or_path, cache_dir)
+    try:
+        lock.acquire(timeout=0)
+    except filelock.Timeout:
+        logger.info("Waiting for another process to finish downloading %s (lock %s)",
+                    model_name_or_path, lock.lock_file)
+        lock.acquire()
+    try:
+        yield lock
+    finally:
+        lock.release()
+
+
 def get_lock(model_name_or_path: str | Path, cache_dir: str | None = None):
     lock_dir = cache_dir or temp_dir
     model_name_or_path = str(model_name_or_path)
@@ -363,7 +467,7 @@ def get_quant_config(
     is_local = os.path.isdir(model_name_or_path)
     if not is_local:
         # Download the config files.
-        with get_lock(model_config.model, load_config.download_dir):
+        with _download_lock(model_config.model, load_config.download_dir):
             hf_folder = hf_api().snapshot_download(
                 model_config.model,
                 revision=model_config.revision,
@@ -439,7 +543,7 @@ def get_sparse_attention_config(
     is_local = os.path.isdir(model_name_or_path)
     if not is_local:
         # Download the config files.
-        with get_lock(model_name_or_path, load_config.download_dir):
+        with _download_lock(model_name_or_path, load_config.download_dir):
             hf_folder = hf_api().snapshot_download(
                 model_name_or_path,
                 revision=model_config.revision,
@@ -543,18 +647,19 @@ def download_weights_from_hf(
     logger.debug("Using model weights format %s", allow_patterns)
     # Use file lock to prevent multiple processes from
     # downloading the same model weights at the same time.
-    with get_lock(model_name_or_path, cache_dir):
+    with _download_lock(model_name_or_path, cache_dir):
         start_time = time.perf_counter()
         for allow_pattern in allow_patterns:
-            hf_folder = hf_api().snapshot_download(
-                model_name_or_path,
-                allow_patterns=allow_pattern,
-                ignore_patterns=ignore_patterns,
-                cache_dir=cache_dir,
-                tqdm_class=DisabledTqdm,
-                revision=revision,
-                local_files_only=local_only,
-            )
+            with _report_download(model_name_or_path, revision, allow_pattern, cache_dir):
+                hf_folder = hf_api().snapshot_download(
+                    model_name_or_path,
+                    allow_patterns=allow_pattern,
+                    ignore_patterns=ignore_patterns,
+                    cache_dir=cache_dir,
+                    tqdm_class=DisabledTqdm,
+                    revision=revision,
+                    local_files_only=local_only,
+                )
             # If we have downloaded weights for this allow_pattern,
             # we don't need to check the rest.
             # allow_pattern can be a list (from weight_map) or str (glob)
