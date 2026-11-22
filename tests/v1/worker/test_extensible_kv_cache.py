@@ -223,6 +223,9 @@ def test_measured_sizing_caps_torch_memory(monkeypatch):
     is extended, less multimodal IPC memory and the non-torch reserve,
     rather than caching fragmented segments until other allocations fail."""
     gib = 1 << 30
+    # The mocked device reports no memory, so pin the floor the reserve below
+    # is derived from: this test is about the cap, not the floor's scaling.
+    monkeypatch.setenv("VLLM_KV_CACHE_MARGIN_FLOOR_MB", "1024")
     limits: list[int | None] = []
     kv_cache = SimpleNamespace(
         reserved_headroom_bytes=gib,
@@ -971,3 +974,28 @@ def test_drafter_capture_writes_kv_only_to_the_null_block(
         speculative_config={"method": "mtp", "num_speculative_tokens": 3},
     ) as runner:
         runner.generate_greedy(["The capital of France is"], max_tokens=16)
+
+
+@pytest.mark.parametrize(
+    "total_gib, floor_mib",
+    [(8, 256), (16, 16 * 1024 * 0.02), (24, 24 * 1024 * 0.02), (80, 1024)],
+)
+def test_margin_floor_scales_with_the_device(monkeypatch, total_gib, floor_mib):
+    """A flat 1 GiB floor is 6% of a 16 GiB card; on CUDA the floor is 2% of
+    the device between 256 MiB and 1 GiB, and the non-torch share half of it."""
+    if extensible_kv_cache.current_platform.is_rocm():
+        pytest.skip("ROCm keeps its own floor")
+    monkeypatch.delenv("VLLM_KV_CACHE_MARGIN_FLOOR_MB", raising=False)
+    monkeypatch.setattr(
+        extensible_kv_cache,
+        "device_memory_info",
+        lambda device: (0, total_gib << 30),
+    )
+    device = torch.device("cpu")
+    floor = extensible_kv_cache.kv_cache_margin_floor_bytes(device)
+    assert floor == int(floor_mib * (1 << 20)) or abs(floor - floor_mib * (1 << 20)) < 1 << 20
+    assert extensible_kv_cache.kv_cache_non_torch_reserve_bytes(device) == min(
+        floor // 2, extensible_kv_cache.KV_CACHE_NON_TORCH_RESERVE_BYTES
+    )
+    monkeypatch.setenv("VLLM_KV_CACHE_MARGIN_FLOOR_MB", "512")
+    assert extensible_kv_cache.kv_cache_margin_floor_bytes(device) == 512 << 20

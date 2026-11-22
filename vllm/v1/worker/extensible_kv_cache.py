@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+import vllm.envs as envs
 from vllm.config.kv_transfer import KVCacheAccess
 from vllm.distributed.kv_transfer import (
     ensure_kv_transfer_initialized,
@@ -72,6 +73,37 @@ KV_CACHE_NON_TORCH_RESERVE_BYTES = (2 if current_platform.is_rocm() else 1) << 2
 # Share of the headroom warmup leaves uncommitted, on top of the profiled
 # activation peak, for transients the profiling run does not exercise.
 KV_CACHE_WARMUP_RESERVE_FRACTION = 0.1
+# On CUDA the floor scales with the device: 2% of its memory, between 256 MiB
+# and the 1 GiB above, so a card of 50 GiB or more keeps the floor measured on
+# datacenter parts. A flat 1 GiB is 6% of a 16 GiB card. Measured on one, it
+# went unused: Qwen3.8-27B 3.00bpw serving a 217K-token prompt grew torch's
+# reservation 0.16 GiB, inside the measured transient reserve, and memory
+# outside torch not at all.
+KV_CACHE_MARGIN_FLOOR_SHARE = 0.02
+KV_CACHE_MARGIN_FLOOR_MIN_BYTES = 1 << 28
+
+
+def kv_cache_margin_floor_bytes(device: torch.device) -> int:
+    """The margin floor for this device: VLLM_KV_CACHE_MARGIN_FLOOR_MB if
+    set, else scaled to the device's memory on CUDA (above)."""
+    if envs.VLLM_KV_CACHE_MARGIN_FLOOR_MB is not None:
+        return envs.VLLM_KV_CACHE_MARGIN_FLOOR_MB << 20
+    if current_platform.is_rocm():
+        return KV_CACHE_MARGIN_FLOOR_BYTES
+    _, total = device_memory_info(device)
+    return min(
+        KV_CACHE_MARGIN_FLOOR_BYTES,
+        max(KV_CACHE_MARGIN_FLOOR_MIN_BYTES, int(total * KV_CACHE_MARGIN_FLOOR_SHARE)),
+    )
+
+
+def kv_cache_non_torch_reserve_bytes(device: torch.device) -> int:
+    """The part of the margin kept for allocations outside torch: at most
+    half the floor, so a smaller floor does not leave torch's own
+    fragmentation no room."""
+    if current_platform.is_rocm() and envs.VLLM_KV_CACHE_MARGIN_FLOOR_MB is None:
+        return KV_CACHE_NON_TORCH_RESERVE_BYTES
+    return min(KV_CACHE_NON_TORCH_RESERVE_BYTES, kv_cache_margin_floor_bytes(device) // 2)
 
 
 class ExtensibleKVCache:
@@ -292,7 +324,8 @@ class ExtensibleKVCache:
             int(headroom * KV_CACHE_WARMUP_RESERVE_FRACTION),
         )
         margin = max(
-            KV_CACHE_MARGIN_FLOOR_BYTES, int(reserve * KV_CACHE_MARGIN_FRACTION)
+            kv_cache_margin_floor_bytes(self.buffer.device),
+            int(reserve * KV_CACHE_MARGIN_FRACTION),
         )
         budget = headroom - margin - reserve
         return max(self.blocks_within(budget), self.num_committed_blocks)
@@ -646,6 +679,7 @@ def measure_kv_cache_blocks(
         transient_peak_bytes=transient_peak,
         torch_reserve_growth_bytes=kv_cache.torch_reserve_growth_bytes,
     )
+    measured["margin_floor_bytes"] = kv_cache_margin_floor_bytes(device)
     available = measure_kv_cache_bytes(requested_memory=requested_memory, **measured)
     utilization = vllm_config.cache_config.gpu_memory_utilization
     # Explicit values just under 1.0 are mostly habits from estimate-based
@@ -686,7 +720,7 @@ def measure_kv_cache_blocks(
         free_memory
         - (kv_cache.physical_bytes_for(num_blocks) - kv_cache.physical_bytes)
         - (available - kv_cache_bytes)
-        - KV_CACHE_NON_TORCH_RESERVE_BYTES
+        - kv_cache_non_torch_reserve_bytes(device)
     )
     torch_memory_limit = torch.accelerator.memory_reserved(device) + max(left_free, 0)
     kv_cache.set_torch_memory_limit(torch_memory_limit)

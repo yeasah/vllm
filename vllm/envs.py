@@ -330,6 +330,7 @@ if TYPE_CHECKING:
     VLLM_WEIGHT_OFFLOADING_DISABLE_UVA: bool = False
     VLLM_RELOAD_MODE: Literal["layerwise", "direct"] = "layerwise"
     VLLM_KV_OFFLOAD_MAX_BATCH_DESCRIPTORS: int = 0
+    VLLM_KV_CACHE_MARGIN_FLOOR_MB: int | None = None
     VLLM_MM_ENCODER_MLP_CHUNK_MB: int = 256
     VLLM_WSL2_ENABLE_PIN_MEMORY: bool = False
     VLLM_DISABLE_LOG_LOGO: bool = False
@@ -2315,6 +2316,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Max descriptors per CPU-KV-offload batch-memcpy call. 0 = platform default
     # (ROCm chunks at 8192, since hipMemcpyBatchAsync faults above that on
     # rocm 7.14/7.15 when batch copy is optimized; CUDA uncapped). Set >0 to override.
+    # Floor (MiB) of the margin an extensible KV cache keeps free beyond its
+    # measured transient reserve. Unset: scaled to the device on CUDA
+    # (vllm/v1/worker/extensible_kv_cache.py), 3 GiB on ROCm.
+    "VLLM_KV_CACHE_MARGIN_FLOOR_MB": lambda: (
+        int(os.environ["VLLM_KV_CACHE_MARGIN_FLOOR_MB"])
+        if "VLLM_KV_CACHE_MARGIN_FLOOR_MB" in os.environ
+        else None
+    ),
     "VLLM_KV_OFFLOAD_MAX_BATCH_DESCRIPTORS": lambda: int(
         os.getenv("VLLM_KV_OFFLOAD_MAX_BATCH_DESCRIPTORS", "0")
     ),
