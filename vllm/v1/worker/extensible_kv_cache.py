@@ -80,6 +80,28 @@ KV_CACHE_WARMUP_RESERVE_FRACTION = 0.1
 # reservation 0.16 GiB, inside the measured transient reserve, and memory
 # outside torch not at all.
 KV_CACHE_MARGIN_FLOOR_SHARE = 0.02
+# The margin is taken on the allocated transient, and torch's reservation growth -- fragmentation, which the
+# sizing step measures directly -- is kept with this much headroom instead of having the margin stacked on it
+# (upstream's own note in #67296: "part of the fragmentation is therefore covered twice"). Measured on 16 GiB
+# cards across long prefills, 8-way sampling with logprobs, prompt logprobs, n=4, JSON, prefix hits and images:
+# serving stayed under the measured growth where growth dominated (Qwen3.6-35B-A3B, Laguna-XS), and went 18-30%
+# past the allocated peak where long-context prefill allocated past what the sizing step ran (gemma-4-26B,
+# Qwen3-0.6B), inside the 0.75 margin on that peak. #68184 measured steady growth at most 5.8% above G.
+KV_CACHE_GROWTH_HEADROOM = 1.1
+
+
+def kv_cache_keep_bytes(
+    transient_peak_bytes: int,
+    torch_reserve_growth_bytes: int,
+    margin_floor_bytes: int = KV_CACHE_MARGIN_FLOOR_BYTES,
+    margin_fraction: float = KV_CACHE_MARGIN_FRACTION,
+    non_torch_reserve_bytes: int = KV_CACHE_NON_TORCH_RESERVE_BYTES,
+) -> int:
+    """Bytes an extensible KV cache keeps free after warmup: the allocated transient plus its margin, or torch's
+    measured reservation growth with headroom plus the non-torch reserve, whichever is larger."""
+    on_peak = transient_peak_bytes + max(margin_floor_bytes, int(transient_peak_bytes * margin_fraction))
+    on_growth = int(torch_reserve_growth_bytes * KV_CACHE_GROWTH_HEADROOM) + non_torch_reserve_bytes
+    return max(on_peak, on_growth)
 KV_CACHE_MARGIN_FLOOR_MIN_BYTES = 1 << 28
 
 
@@ -632,6 +654,7 @@ def measure_kv_cache_bytes(
     torch_reserve_growth_bytes: int = 0,
     margin_floor_bytes: int = KV_CACHE_MARGIN_FLOOR_BYTES,
     margin_fraction: float = KV_CACHE_MARGIN_FRACTION,
+    non_torch_reserve_bytes: int = KV_CACHE_NON_TORCH_RESERVE_BYTES,
 ) -> int:
     """Bytes the KV cache may occupy given the memory measured after warmup.
 
@@ -645,9 +668,12 @@ def measure_kv_cache_bytes(
     """
     non_kv_used = init_free_memory - free_memory - committed_bytes
     headroom = free_memory + committed_bytes
-    margin = max(margin_floor_bytes, int(transient_peak_bytes * margin_fraction))
-    available = min(requested_memory - non_kv_used, headroom - margin)
-    available -= max(transient_peak_bytes, torch_reserve_growth_bytes)
+    # The device headroom keeps `kv_cache_keep_bytes`; an explicit budget that already leaves room keeps only the
+    # transient itself, as before
+    keep = kv_cache_keep_bytes(transient_peak_bytes, torch_reserve_growth_bytes, margin_floor_bytes,
+                               margin_fraction, non_torch_reserve_bytes)
+    available = min(requested_memory - non_kv_used - max(transient_peak_bytes, torch_reserve_growth_bytes),
+                    headroom - keep)
     return max(available, 0)
 
 
@@ -680,6 +706,7 @@ def measure_kv_cache_blocks(
         torch_reserve_growth_bytes=kv_cache.torch_reserve_growth_bytes,
     )
     measured["margin_floor_bytes"] = kv_cache_margin_floor_bytes(device)
+    measured["non_torch_reserve_bytes"] = kv_cache_non_torch_reserve_bytes(device)
     available = measure_kv_cache_bytes(requested_memory=requested_memory, **measured)
     utilization = vllm_config.cache_config.gpu_memory_utilization
     # Explicit values just under 1.0 are mostly habits from estimate-based

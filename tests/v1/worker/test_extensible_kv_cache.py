@@ -126,6 +126,7 @@ def test_measure_kv_cache_bytes():
         committed_bytes=1 * gib,
         margin_floor_bytes=0,
         margin_fraction=0.0,
+        non_torch_reserve_bytes=0,
     )
     # Budget-bound: 9 - 3 = 6 GiB for the KV cache.
     assert measure_kv_cache_bytes(requested_memory=9 * gib, **common) == 6 * gib
@@ -145,8 +146,9 @@ def test_measure_kv_cache_bytes():
         == 5 * gib
     )
     # So is a larger growth of torch's reservation over the same steps
-    # (fragmentation), without raising the margin, which scales with the
-    # allocated peak alone.
+    # (fragmentation), with KV_CACHE_GROWTH_HEADROOM rather than the margin on
+    # top: the margin covers the allocated peak (1 + 1 GiB), the measured
+    # growth covers fragmentation (2 GiB x 1.1), and the larger is kept.
     assert (
         measure_kv_cache_bytes(
             requested_memory=20 * gib,
@@ -154,7 +156,27 @@ def test_measure_kv_cache_bytes():
             torch_reserve_growth_bytes=2 * gib,
             **{**common, "margin_fraction": 1.0},
         )
-        == 4 * gib
+        == 7 * gib - int(2 * gib * extensible_kv_cache.KV_CACHE_GROWTH_HEADROOM)
+    )
+    # Where the allocated peak and its margin outweigh the growth, they decide.
+    assert (
+        measure_kv_cache_bytes(
+            requested_memory=20 * gib,
+            transient_peak_bytes=2 * gib,
+            torch_reserve_growth_bytes=gib,
+            **{**common, "margin_fraction": 0.75},
+        )
+        == 7 * gib - int(3.5 * gib)
+    )
+    # The non-torch reserve rides on the growth side: it is part of what the
+    # margin used to cover.
+    assert (
+        measure_kv_cache_bytes(
+            requested_memory=20 * gib,
+            torch_reserve_growth_bytes=gib,
+            **{**common, "non_torch_reserve_bytes": gib // 2},
+        )
+        == 7 * gib - int(gib * extensible_kv_cache.KV_CACHE_GROWTH_HEADROOM) - gib // 2
     )
     # The margin is a share of that peak with a floor, taken off the headroom
     # (floor or fraction, whichever is larger), never off an explicit budget
