@@ -450,6 +450,14 @@ class Worker(WorkerBase):
     @instrument(span_name="Init device")
     def init_device(self):
         if self.device_config.device_type == "cuda":
+            # Before this worker allocates anything, so every segment it makes is expandable.
+            from vllm.device_allocator.alloc_conf import maybe_default_expandable_segments
+
+            if maybe_default_expandable_segments(self.parallel_config.tensor_parallel_size):
+                logger.info_once(
+                    "Expandable segments on: torch carries the PyTorch #196258 fix. "
+                    "Set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False to opt out."
+                )
             # This env var set by Ray causes exceptions with graph building.
             os.environ.pop("NCCL_ASYNC_ERROR_HANDLING", None)
             parallel_config = self.parallel_config

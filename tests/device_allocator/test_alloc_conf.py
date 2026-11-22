@@ -145,3 +145,48 @@ def test_non_expandable_allocations(monkeypatch):
             pass
         raise RuntimeError("capture failed")
     assert writes == ["max_split_size_mb:512,expandable_segments:False", conf]
+
+
+def test_expandable_segments_default_needs_the_fix_and_an_unset_flag(monkeypatch):
+    """Expandable segments go on by default only where torch carries the PyTorch #196258 fix (its stamp
+    verifies) and the user left the flag unset; an explicit setting either way stands."""
+    from vllm.device_allocator import alloc_conf
+
+    written = []
+    monkeypatch.setattr(alloc_conf, "set_alloc_conf", written.append)
+    monkeypatch.setattr(alloc_conf, "current_alloc_conf", lambda: "max_split_size_mb:512")
+    for var in alloc_conf.ALLOC_CONF_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+
+    monkeypatch.setattr(alloc_conf, "expandable_segments_fix_present", lambda: False)
+    assert not alloc_conf.maybe_default_expandable_segments() and written == []
+
+    monkeypatch.setattr(alloc_conf, "expandable_segments_fix_present", lambda: True)
+    assert alloc_conf.maybe_default_expandable_segments()
+    assert alloc_conf.conf_flag_enabled(written[-1], "expandable_segments")
+    assert "max_split_size_mb:512" in written[-1], "the rest of the config survives"
+
+    written.clear()
+    assert not alloc_conf.maybe_default_expandable_segments(tensor_parallel_size=2) and written == [], (
+        "custom all-reduce's legacy IPC cannot export expandable segments"
+    )
+    for value in ("False", "True"):
+        monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", f"expandable_segments:{value}")
+        assert not alloc_conf.maybe_default_expandable_segments() and written == []
+
+
+def test_expandable_segments_fix_probe_checks_the_library_against_its_stamp(monkeypatch, tmp_path):
+    import hashlib
+
+    from vllm.device_allocator import alloc_conf
+
+    (tmp_path / "lib").mkdir()
+    lib = tmp_path / "lib" / "libc10_cuda.so"
+    lib.write_bytes(b"patched")
+    monkeypatch.setattr(alloc_conf.torch, "__file__", str(tmp_path / "__init__.py"))
+    assert not alloc_conf.expandable_segments_fix_present()
+    stamp = f"{lib}.fix-{alloc_conf.EXPANDABLE_SEGMENTS_FIX}"
+    open(stamp, "w").write(hashlib.sha256(b"patched").hexdigest() + "  -\n")
+    assert alloc_conf.expandable_segments_fix_present()
+    lib.write_bytes(b"reinstalled")
+    assert not alloc_conf.expandable_segments_fix_present(), "a stamp beside a reinstalled torch does not count"
