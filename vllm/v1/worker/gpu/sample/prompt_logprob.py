@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
 import numpy as np
@@ -18,6 +18,35 @@ from vllm.v1.worker.gpu.sample.logprob import (
 )
 
 CHUNK_SIZE = 1024
+# Prompt logits are computed CHUNK_SIZE rows at a time, but no more than this
+# many bytes of them: a fixed row count is 485 MiB of bf16 logits at a 248k
+# vocabulary (Qwen3.5 and later), and the step that sizes an extensible KV
+# cache requests prompt logprobs whether or not anyone will, so that chunk was
+# half its transient reserve on a 16 GiB card (Qwen3.8-27B, 2048-token
+# batches: 0.96 GiB reserved, 0.48 without prompt logprobs). The row size is
+# learned once from a one-row probe whose logits are discarded, so every chunk
+# is the same size and a prompt that fits one chunk is computed in one call,
+# as before; small vocabularies keep CHUNK_SIZE rows.
+PROMPT_LOGITS_CHUNK_BYTES = 64 << 20
+_logit_row_bytes: int | None = None
+
+
+def _logit_chunks(
+    lo: int, hi: int, logits_of: Callable[[int, int], torch.Tensor]
+) -> Iterator[tuple[int, int, torch.Tensor]]:
+    """(start, end, logits) over rows [lo, hi), each chunk within the byte
+    budget above."""
+    global _logit_row_bytes
+    if hi <= lo:
+        return
+    if _logit_row_bytes is None:
+        probe = logits_of(lo, lo + 1)
+        _logit_row_bytes = max(probe.shape[-1] * probe.element_size(), 1)
+        del probe
+    rows = max(1, min(CHUNK_SIZE, PROMPT_LOGITS_CHUNK_BYTES // _logit_row_bytes))
+    for a in range(lo, hi, rows):
+        b = min(a + rows, hi)
+        yield a, b, logits_of(a, b)
 # Cap rows x k per torch.topk call, whose workspace grows with both (~5.5 GiB
 # for 1024 rows at a 152k vocab). Only splits chunks when k is very large.
 TOPK_MAX_ELEMENTS = 64 << 20
@@ -106,9 +135,9 @@ class PromptLogprobsWorker:
             lo = max(start, chunk_start)
             hi = min(chunk_end, prompt_len - 1)
             base = int(input_batch.query_start_loc_np[i]) - chunk_start
-            for a in range(lo, hi, CHUNK_SIZE):
-                b = min(a + CHUNK_SIZE, hi)
-                logits = logits_fn(hidden_states[base + a : base + b])
+            for a, b, logits in _logit_chunks(
+                lo, hi, lambda a, b: logits_fn(hidden_states[base + a : base + b])
+            ):
                 ids = req.token_ids[a - start : b - start]
                 req.scores[a - start : b - start] = (
                     logits.gather(-1, ids)
@@ -302,10 +331,10 @@ def compute_prompt_logprobs_with_chunking(
     ranks: torch.Tensor | None = None
     logits_mode = logprobs_mode in ("raw_logits", "processed_logits")
     prompt_token_ids = prompt_token_ids.to(torch.int64)
-    for start_idx in range(0, num_tokens, CHUNK_SIZE):
-        end_idx = start_idx + CHUNK_SIZE
-        # NOTE(woosuk): logits_fn can be slow because it involves all-gather.
-        prompt_logits = logits_fn(prompt_hidden_states[start_idx:end_idx])
+    # NOTE(woosuk): logits_fn can be slow because it involves all-gather.
+    for start_idx, _, prompt_logits in _logit_chunks(
+        0, num_tokens, lambda a, b: logits_fn(prompt_hidden_states[a:b])
+    ):
         requested_num = (
             prompt_logits.shape[-1]
             if num_prompt_logprobs == -1
