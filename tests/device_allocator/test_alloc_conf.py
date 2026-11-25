@@ -170,6 +170,13 @@ def test_expandable_segments_default_needs_the_fix_and_an_unset_flag(monkeypatch
     assert not alloc_conf.maybe_default_expandable_segments(tensor_parallel_size=2) and written == [], (
         "custom all-reduce's legacy IPC cannot export expandable segments"
     )
+    import vllm.platforms.interface as interface
+
+    monkeypatch.setattr(interface, "in_wsl", lambda: True)
+    assert not alloc_conf.maybe_default_expandable_segments() and written == [], (
+        "WSL's driver fails expandable segments' mapping"
+    )
+    monkeypatch.setattr(interface, "in_wsl", lambda: False)
     for value in ("False", "True"):
         monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", f"expandable_segments:{value}")
         assert not alloc_conf.maybe_default_expandable_segments() and written == []

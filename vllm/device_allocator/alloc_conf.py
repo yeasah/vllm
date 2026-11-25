@@ -170,8 +170,16 @@ def maybe_default_expandable_segments(tensor_parallel_size: int = 1) -> bool:
     Not under tensor parallelism: custom all-reduce registers CUDA-graph buffers with the legacy
     cudaIpcGetMemHandle, which cannot export expandable segments' virtual-memory allocations, so graph capture
     fails on any box with peer access ('invalid argument', csrc/custom_all_reduce.cuh), and the TP group's other
-    IPC backends are unchecked under them."""
+    IPC backends are unchecked under them.
+
+    Not under WSL either: WDDM's driver path fails expandable segments' memory mapping with CUDA_ERROR_NOT_READY
+    ("CUDA driver error: device not ready") on some allocation patterns -- gemma-4-12B EXL3 on an RTX 3060 failed
+    to load every time with them on, and loaded with them off."""
     if tensor_parallel_size > 1:
+        return False
+    from vllm.platforms.interface import in_wsl
+
+    if in_wsl():
         return False
     if EXPANDABLE_SEGMENTS in alloc_conf_from_env() or not expandable_segments_fix_present():
         return False
