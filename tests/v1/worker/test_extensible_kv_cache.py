@@ -407,8 +407,8 @@ def test_measured_sizing_counts_reclaimable_memory_on_integrated_gpu(monkeypatch
 
     num_blocks = measure()
 
-    # headroom 101 GiB, margin 0.75 * 7, non-KV use 110 - 100 - 1 = 9 GiB:
-    # min(96 - 9, 101 - 5.25) - 7 = 80 GiB.
+    # headroom 101 GiB, margin 0.5 * 7, non-KV use 110 - 100 - 1 = 9 GiB:
+    # min(96 - 9, 101 - 3.5) - 7 = 80 GiB.
     assert num_blocks == 80
 
     # The raw figure would have sized it to nothing.

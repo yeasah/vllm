@@ -63,7 +63,7 @@ logger = init_logger(__name__)
 # ROCr also maps kernel scratch outside the allocator when a kernel first needs
 # it, so ROCm keeps a larger floor.
 KV_CACHE_MARGIN_FLOOR_BYTES = (3 if current_platform.is_rocm() else 1) << 30
-KV_CACHE_MARGIN_FRACTION = 0.75
+KV_CACHE_MARGIN_FRACTION = 0.5
 # Part of the margin kept for allocations outside torch's caching allocator
 # (kernel scratch, NCCL/RCCL buffers, lazily loaded code objects); the
 # allocator is capped to leave it free. The rest absorbs torch's fragmentation,
@@ -86,7 +86,10 @@ KV_CACHE_MARGIN_FLOOR_SHARE = 0.02
 # cards across long prefills, 8-way sampling with logprobs, prompt logprobs, n=4, JSON, prefix hits and images:
 # serving stayed under the measured growth where growth dominated (Qwen3.6-35B-A3B, Laguna-XS), and went 18-30%
 # past the allocated peak where long-context prefill allocated past what the sizing step ran (gemma-4-26B,
-# Qwen3-0.6B), inside the 0.75 margin on that peak. #68184 measured steady growth at most 5.8% above G.
+# Qwen3-0.6B). On Qwen3.6-35B-A3B at 2K-16K batched tokens, allocation stayed within 2% of that peak and the
+# 16K budget's worst phase (a 64K-token prefill) grew reservation, not allocation: its 0.75 margin kept 2.98 GiB
+# against 1.92 used. The fraction is 0.5, above every excess measured here and the 45% above.
+# #68184 measured steady growth at most 5.8% above G.
 KV_CACHE_GROWTH_HEADROOM = 1.1
 
 
